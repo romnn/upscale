@@ -18,7 +18,8 @@ dependency with the `wgpu` feature.
   The app checks `navigator.gpu` on load and shows a clear message if WebGPU
   isn't available — everything else in the UI is gated behind that check.
 - Rust target `wasm32-unknown-unknown` (`rustup target add wasm32-unknown-unknown`).
-- [`trunk`](https://trunkrs.dev/) (tested with 0.21.x): `cargo install trunk`.
+- [`trunk`](https://trunkrs.dev/) (tested with 0.21.x): installed by `mise install`
+  (declared in the repo `mise.toml`), or `cargo install trunk`.
 
 ## Build
 
@@ -69,6 +70,16 @@ ln -sf "$snap"/unet/diffusion_pytorch_model.fp16.safetensors crates/web/models/u
 ln -sf "$snap"/vae/diffusion_pytorch_model.fp16.safetensors  crates/web/models/vae.fp16.safetensors
 ```
 
+The quickest way to run both processes is one command from the repo root:
+
+```bash
+task web:dev   # trunk hot-reload server (:8788) + models file server (:8787)
+```
+
+`web:dev` just launches the two steps below concurrently; run them by hand in
+separate terminals instead (`task web:serve` / `task web:models`) when you want
+to watch or restart each independently:
+
 1. In one terminal, serve `crates/web/` (the parent of `models/`) as static
    files on port 8787, so `http://127.0.0.1:8787/models/unet.safetensors` and
    `.../models/vae.safetensors` resolve:
@@ -86,7 +97,7 @@ ln -sf "$snap"/vae/diffusion_pytorch_model.fp16.safetensors  crates/web/models/v
    ```
 
    `Trunk.toml` proxies any request to `/models/*` on trunk's dev server
-   (default `http://127.0.0.1:8080`) through to the file server from step 1.
+   (`http://127.0.0.1:8788`) through to the file server from step 1.
 
 If you'd rather not run a second process, an alternative is to add
 `<link data-trunk rel="copy-dir" href="models" data-target-path="models">`
