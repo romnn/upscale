@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+tasks:
+  default:
+    cmds:
+      - task: check
+
+  format:
+    desc: "format cargo workspace"
+    cmds:
+      - cargo fmt --all {{.CLI_ARGS}}
+
+  check:
+    desc: "check the native crates"
+    cmds:
+      - cargo check --all-targets {{.CLI_ARGS}}
+
+  check:fc:
+    desc: "check every feature combination (sd-upscale native, web on wasm)"
+    cmds:
+      - cargo fc check --workspace {{.CLI_ARGS}}
+
+  test:
+    desc: "test the native crates"
+    cmds:
+      - cargo nextest run --all-targets --no-tests "warn" {{.CLI_ARGS}}
+
+  test:fc:
+    desc: "test every feature combination"
+    cmds:
+      - cargo fc nextest run --all-targets --no-tests "warn" {{.CLI_ARGS}}
+
+  test:doc:
+    desc: "run doctests"
+    cmds:
+      - cargo test --doc {{.CLI_ARGS}}
+
+  lint:ast-grep:
+    desc: "lint with ast-grep rules"
+    cmds:
+      - sg scan
+
+  lint:
+    desc: "lint the native crates"
+    cmds:
+      - cargo lint {{.CLI_ARGS}}
+      - task: lint:ast-grep
+
+  lint:fc:
+    desc: "lint every feature combination (sd-upscale native, web on wasm)"
+    cmds:
+      - cargo fc lint --dedup --workspace {{.CLI_ARGS}}
+      - task: lint:ast-grep
+
+  lint:fix:
+    desc: "lint and fix"
+    aliases: [fix]
+    cmds:
+      - cargo fixit {{.CLI_ARGS}}
+      - task: lint:ast-grep
+
+  lint:actions:
+    desc: "lint github actions workflows"
+    cmds:
+      - actionlint
+
+  audit:
+    desc: "audit dependencies for security advisories"
+    cmds:
+      - cargo audit {{.CLI_ARGS}}
+
+  unused:
+    desc: "check for unused dependencies"
+    aliases: [unused-dependencies]
+    cmds:
+      - cargo +nightly udeps {{.CLI_ARGS}}
+
+  outdated:
+    desc: "check for outdated dependencies"
+    cmds:
+      - cargo outdated --workspace --exit-code 1 {{.CLI_ARGS}}
+
+  typos:
+    desc: "check for typos"
+    aliases: [spellcheck]
+    cmds:
+      - typos {{.CLI_ARGS}}

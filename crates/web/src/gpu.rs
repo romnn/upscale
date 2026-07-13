@@ -14,7 +14,9 @@
 
 use std::cell::Cell;
 
-use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup_async};
+use burn::backend::wgpu::{
+    graphics::AutoGraphicsApi, init_setup_async, RuntimeOptions, WgpuDevice,
+};
 
 thread_local! {
     static GPU_READY: Cell<bool> = const { Cell::new(false) };

@@ -1,0 +1,80 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
+name: lint
+on:
+  push: {}
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  schedule:
+    - cron: "0 8 1 1,6 *"
+
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint (all feature combinations; sd-upscale native + web on wasm)
+        run: task lint:fc
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Audit
+        run: task audit
+
+  unused-dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Check for unused dependencies
+        run: task unused
+
+  outdated:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check for outdated dependencies
+        run: task outdated
+
+  spellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - name: Spellcheck
+        run: task typos
+
+  actions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - name: Lint workflows
+        run: task lint:actions

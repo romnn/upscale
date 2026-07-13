@@ -124,8 +124,11 @@ pub async fn load_model_bytes(
     on_status(ModelStatus::Saving);
     if let Err(e) = JsFuture::from(cache.put_with_str(url, &resp_for_cache)).await {
         web_sys::console::warn_1(
-            &format!("cache.put failed for {url} (continuing without caching): {}", js_err(e))
-                .into(),
+            &format!(
+                "cache.put failed for {url} (continuing without caching): {}",
+                js_err(e)
+            )
+            .into(),
         );
     }
 

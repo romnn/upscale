@@ -6,12 +6,19 @@
 //! (add `--features wgpu` or `--features cuda` to run on GPU backends).
 //! Requires the fixture from `python/dump_scheduler_fixture.py`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test/example code fails loudly by design"
+)]
 mod common;
 
 use common::{rel_l2, tensor_from, test_device, TestBackend as B};
 use safetensors::SafeTensors;
 use sd_upscale::scheduler::{DdimScheduler, LowResNoiser};
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn ddim_step_matches_diffusers() {
     let device = test_device();
@@ -52,6 +59,7 @@ fn ddim_step_matches_diffusers() {
     assert!(err < 1e-4, "ddim step diverged: rel_l2 = {err:.3e}");
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn ddpm_add_noise_matches_diffusers() {
     let device = test_device();

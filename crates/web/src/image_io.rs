@@ -25,7 +25,10 @@ fn js_err(e: JsValue) -> String {
         .unwrap_or_else(|| "unknown JS error".to_string())
 }
 
-fn new_canvas(width: u32, height: u32) -> Result<(HtmlCanvasElement, CanvasRenderingContext2d), String> {
+fn new_canvas(
+    width: u32,
+    height: u32,
+) -> Result<(HtmlCanvasElement, CanvasRenderingContext2d), String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let canvas: HtmlCanvasElement = document

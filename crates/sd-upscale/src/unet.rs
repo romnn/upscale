@@ -160,9 +160,8 @@ impl<B: Backend> Attention<B> {
         let v = self.to_v.forward(context);
 
         // [B, L, inner] -> [B, heads, L, head_dim]
-        let split = |t: Tensor<B, 3>, len: usize| {
-            t.reshape([b, len, self.heads, head_dim]).swap_dims(1, 2)
-        };
+        let split =
+            |t: Tensor<B, 3>, len: usize| t.reshape([b, len, self.heads, head_dim]).swap_dims(1, 2);
         let q = split(q, n);
         let k = split(k, m);
         let v = split(v, m);
@@ -258,7 +257,12 @@ pub struct Transformer2D<B: Backend> {
 }
 
 impl<B: Backend> Transformer2D<B> {
-    pub fn new(channels: usize, num_blocks: usize, only_cross_attention: bool, device: &B::Device) -> Self {
+    pub fn new(
+        channels: usize,
+        num_blocks: usize,
+        only_cross_attention: bool,
+        device: &B::Device,
+    ) -> Self {
         let transformer_blocks = (0..num_blocks)
             .map(|_| BasicTransformerBlock::new(channels, only_cross_attention, device))
             .collect();
@@ -403,6 +407,10 @@ impl<B: Backend> UpBlock<B> {
         context: Tensor<B, 3>,
     ) -> Tensor<B, 4> {
         for (i, resnet) in self.resnets.iter().enumerate() {
+            #[expect(
+                clippy::expect_used,
+                reason = "each up-block resnet consumes exactly one skip by construction"
+            )]
             let skip = skips.pop().expect("skip connection underflow");
             h = Tensor::cat(vec![h, skip], 1);
             h = resnet.forward(h, temb.clone());
@@ -417,10 +425,7 @@ impl<B: Backend> UpBlock<B> {
     }
 }
 
-fn resnets<B: Backend>(
-    chans: &[(usize, usize)],
-    device: &B::Device,
-) -> Vec<ResnetBlockTemb<B>> {
+fn resnets<B: Backend>(chans: &[(usize, usize)], device: &B::Device) -> Vec<ResnetBlockTemb<B>> {
     chans
         .iter()
         .map(|&(i, o)| ResnetBlockTemb::new(i, o, TIME_DIM, device))

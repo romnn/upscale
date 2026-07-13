@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
+use burn::backend::Wgpu;
 use leptos::prelude::*;
 use sd_upscale::pipeline::{UpscaleOptions, Upscaler};
 use wasm_bindgen::JsCast;
@@ -45,7 +45,11 @@ fn file_from_drop(ev: &DragEvent) -> Option<web_sys::File> {
     ev.data_transfer()?.files()?.get(0)
 }
 
-async fn fetch_part(part: ModelPart, url: &str, status: RwSignal<Status>) -> Result<Rc<Vec<u8>>, String> {
+async fn fetch_part(
+    part: ModelPart,
+    url: &str,
+    status: RwSignal<Status>,
+) -> Result<Rc<Vec<u8>>, String> {
     let bytes = model_cache::load_model_bytes(url, |s| {
         status.set(Status::LoadingModel(part, s));
     })
@@ -103,7 +107,10 @@ pub fn App() -> impl IntoView {
     };
 
     let on_file_input = move |ev: Event| {
-        let Some(input) = ev.target().and_then(|t| t.dyn_into::<HtmlInputElement>().ok()) else {
+        let Some(input) = ev
+            .target()
+            .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
+        else {
             return;
         };
         if let Some(file) = file_from_input(&input) {
@@ -137,7 +144,11 @@ pub fn App() -> impl IntoView {
         }
         let base = model_base_url.get_untracked();
         let half = fp16.get_untracked();
-        let suffix = if half { "fp16.safetensors" } else { "safetensors" };
+        let suffix = if half {
+            "fp16.safetensors"
+        } else {
+            "safetensors"
+        };
         let unet_url = format!("{base}/unet.{suffix}");
         let vae_url = format!("{base}/vae.{suffix}");
         let opts = UpscaleOptions {
@@ -191,10 +202,20 @@ pub fn App() -> impl IntoView {
 
             let need_build = upscaler.with_value(Option::is_none);
             if need_build {
-                let unet = unet_bytes.with_value(Clone::clone).expect("just populated above");
-                let vae = vae_bytes.with_value(Clone::clone).expect("just populated above");
+                let unet = unet_bytes
+                    .with_value(Clone::clone)
+                    .expect("just populated above");
+                let vae = vae_bytes
+                    .with_value(Clone::clone)
+                    .expect("just populated above");
                 status.set(Status::BuildingPipeline);
-                let built = Upscaler::<Wgpu>::load_full(&unet, &vae, EMPTY_PROMPT_EMBED, half, WgpuDevice::default());
+                let built = Upscaler::<Wgpu>::load_full(
+                    &unet,
+                    &vae,
+                    EMPTY_PROMPT_EMBED,
+                    half,
+                    WgpuDevice::default(),
+                );
                 match built {
                     Ok(up) => upscaler.set_value(Some(Rc::new(up))),
                     Err(e) => {
@@ -208,13 +229,20 @@ pub fn App() -> impl IntoView {
             status.set(Status::Running);
             let up = upscaler.with_value(|u| u.as_ref().expect("built above").clone());
             let out = up
-                .upscale_rgba(&src.rgba, src.width as usize, src.height as usize, &opts, &mut |p| {
-                    progress.set(p);
-                })
+                .upscale_rgba(
+                    &src.rgba,
+                    src.width as usize,
+                    src.height as usize,
+                    &opts,
+                    &mut |p| {
+                        progress.set(p);
+                    },
+                )
                 .await;
 
             match out {
-                Ok((rgba, ow, oh)) => match image_io::rgba_to_data_url(&rgba, ow as u32, oh as u32) {
+                Ok((rgba, ow, oh)) => match image_io::rgba_to_data_url(&rgba, ow as u32, oh as u32)
+                {
                     Ok(data_url) => {
                         result.set(Some(ImageBuf {
                             rgba,

@@ -1,0 +1,21 @@
+[tools]
+zig = "latest"
+task = "latest"
+ast-grep = "latest"
+typos = "latest"
+actionlint = "latest"
+
+"github:rust-cross/cargo-zigbuild" = "latest"
+"github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc" }
+"aqua:rustsec/rustsec/cargo-audit" = "latest"
+"github:est31/cargo-udeps" = "latest"
+"github:kbknapp/cargo-outdated" = "latest"
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+
+[settings]
+lockfile = true
+lockfile_platforms = [
+  "linux-x64",
+  "macos-arm64",
+  "windows-x64",
+]

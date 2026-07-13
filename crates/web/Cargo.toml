@@ -1,15 +1,15 @@
-# Deliberately its own workspace (not a member of the parent `../../Cargo.toml`):
-# this crate builds for wasm32-unknown-unknown with a very different dependency
-# set (leptos, web-sys, wasm-bindgen) and the parent workspace's native
-# CPU/CUDA test harness should never have to re-resolve/rebuild for wasm.
-[workspace]
-
 [package]
 name = "web"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
+
+# wasm-only crate: excluded from the workspace's `default-members` so native
+# `cargo` never tries to build it (leptos/web-sys/`getrandom` `wasm_js` don't
+# compile off wasm), and pinned to the wasm target for `cargo fc check/lint`.
+[package.metadata.cargo-fc]
+targets = ["wasm32-unknown-unknown"]
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
@@ -73,7 +73,3 @@ features = [
   "ReadableStreamGetReaderOptions",
   "ReadableStreamReaderMode",
 ]
-
-[profile.release]
-opt-level = "s"
-lto = true

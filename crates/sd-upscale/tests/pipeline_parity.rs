@@ -6,6 +6,13 @@
 //!
 //! Requires the pretrained UNet + VAE and `python/dump_pipeline_fixture.py`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::clone_on_copy,
+    reason = "test fails loudly by design; device.clone() is required for the non-Copy wgpu device"
+)]
 mod common;
 
 use common::{rel_l2, tensor_from, test_device, TestBackend as B};
@@ -27,6 +34,7 @@ fn model_path(subfolder: &str, env: &str) -> String {
     })
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn pipeline_matches_diffusers() {
     let device = test_device();
@@ -38,7 +46,8 @@ fn pipeline_matches_diffusers() {
     .expect("run python/dump_pipeline_fixture.py first");
     let st = SafeTensors::deserialize(&bytes).unwrap();
 
-    let unet = load_unet::<B>(&model_path("unet", "SD_X4_UNET"), false, &device).expect("load unet");
+    let unet =
+        load_unet::<B>(&model_path("unet", "SD_X4_UNET"), false, &device).expect("load unet");
     let vae =
         load_vae_decoder::<B>(&model_path("vae", "SD_X4_VAE"), false, &device).expect("load vae");
     let embed = tensor_from::<B, 3>(&st, "prompt_embeds", &device);
@@ -56,9 +65,15 @@ fn pipeline_matches_diffusers() {
         init_latents,
         low_res_noise,
     );
-    let latents_err = rel_l2::<B, 4>(latents.clone(), tensor_from::<B, 4>(&st, "final_latents", &device));
+    let latents_err = rel_l2::<B, 4>(
+        latents.clone(),
+        tensor_from::<B, 4>(&st, "final_latents", &device),
+    );
     println!("final_latents rel_l2 = {latents_err:.3e}");
-    assert!(latents_err < 2e-2, "denoise loop diverged: {latents_err:.3e}");
+    assert!(
+        latents_err < 2e-2,
+        "denoise loop diverged: {latents_err:.3e}"
+    );
 
     // Stage 2: VAE decode + postprocess.
     let out = up.decode_latents(latents);

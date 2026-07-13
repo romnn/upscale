@@ -7,6 +7,12 @@
 //! pretrained VAE (`SD_X4_VAE`, or the default HF cache path) and the fixtures
 //! from `python/dump_vae_fixture.py`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test/example code fails loudly by design"
+)]
 mod common;
 
 use burn::tensor::Tensor;
@@ -25,6 +31,7 @@ fn vae_path() -> String {
     })
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn vae_decoder_matches_diffusers() {
     let device = test_device();

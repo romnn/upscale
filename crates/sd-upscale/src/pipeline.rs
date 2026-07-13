@@ -116,7 +116,12 @@ impl<B: Backend> Upscaler<B> {
         init_latents: Tensor<B, 4>,
         low_res_noise: Tensor<B, 4>,
     ) -> Tensor<B, 4> {
+        #[expect(
+            clippy::expect_used,
+            reason = "denoise requires a full pipeline (new/load_full); upscale_rgba guards this via is_full()"
+        )]
         let unet = self.unet.as_ref().expect("unet not loaded");
+        #[expect(clippy::expect_used, reason = "full pipeline invariant, as above")]
         let context = self.text_embed.clone().expect("text embed not loaded");
 
         // preprocess to [-1,1], then DDPM-noise the conditioning image once.
@@ -129,8 +134,13 @@ impl<B: Backend> Upscaler<B> {
         let mut latents = init_latents;
         for t in ddim.timesteps().to_vec() {
             let model_input = Tensor::cat(vec![latents.clone(), image.clone()], 1);
-            let noise_pred =
-                unet.forward(model_input, t as f32, context.clone(), noise_level, &self.device);
+            let noise_pred = unet.forward(
+                model_input,
+                t as f32,
+                context.clone(),
+                noise_level,
+                &self.device,
+            );
             latents = ddim.step(noise_pred, t, latents);
         }
         latents
@@ -151,7 +161,13 @@ impl<B: Backend> Upscaler<B> {
         init_latents: Tensor<B, 4>,
         low_res_noise: Tensor<B, 4>,
     ) -> Tensor<B, 4> {
-        let latents = self.denoise(low_res01, noise_level, num_steps, init_latents, low_res_noise);
+        let latents = self.denoise(
+            low_res01,
+            noise_level,
+            num_steps,
+            init_latents,
+            low_res_noise,
+        );
         self.decode_latents(latents)
     }
 
@@ -200,8 +216,10 @@ impl<B: Backend> Upscaler<B> {
                 let (th, tw) = (y_end - y0, x_end - x0);
 
                 let tile_t = full.clone().narrow(2, y0, th).narrow(3, x0, tw);
-                let init = Tensor::random([1, 4, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
-                let lrn = Tensor::random([1, 3, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
+                let init =
+                    Tensor::random([1, 4, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
+                let lrn =
+                    Tensor::random([1, 3, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
                 let out_tile = self.denoise_decode(tile_t, opts.noise_level, opts.steps, init, lrn);
 
                 let [_, _, th4, tw4] = out_tile.dims();
@@ -212,7 +230,16 @@ impl<B: Backend> Upscaler<B> {
                 let vals = data
                     .as_slice::<f32>()
                     .map_err(|e| format!("tile readback: {e:?}"))?;
-                accumulate(&mut out, &mut weight, vals, th4, tw4, ow, x0 * SCALE, y0 * SCALE);
+                accumulate(
+                    &mut out,
+                    &mut weight,
+                    vals,
+                    th4,
+                    tw4,
+                    ow,
+                    x0 * SCALE,
+                    y0 * SCALE,
+                );
 
                 done += 1;
                 on_progress(done as f32 / total as f32);
@@ -242,7 +269,6 @@ fn rgba_to_tensor<B: Backend>(
 
 /// Add a decoded output tile's CHW `vals` (`[3, th, tw]`) into the accumulation
 /// buffers at pixel offset `(ox, oy)`, one weight unit per covered pixel.
-#[allow(clippy::too_many_arguments)]
 fn accumulate(
     out: &mut [f32],
     weight: &mut [f32],

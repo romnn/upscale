@@ -1,0 +1,5 @@
+[default.extend-words]
+Nd = "Nd"           # NdArray (burn backend)
+Noiser = "Noiser"   # LowResNoiser (DDPM low-res noiser)
+noiser = "noiser"
+arange = "arange"   # numpy `arange`, referenced in scheduler docs

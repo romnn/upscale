@@ -114,7 +114,7 @@ impl<B: Backend> Decoder<B> {
     fn new(config: &VaeConfig, device: &B::Device) -> Self {
         let reversed: Vec<usize> = config.block_out_channels.iter().copied().rev().collect();
         let first = reversed[0];
-        let last = *reversed.last().unwrap();
+        let last = reversed[reversed.len() - 1];
         let num_resnets = config.layers_per_block + 1;
 
         let mut up_blocks = Vec::with_capacity(reversed.len());

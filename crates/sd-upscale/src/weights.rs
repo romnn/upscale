@@ -64,7 +64,11 @@ fn unet_remaps(store: SafetensorsStore) -> SafetensorsStore {
 
 /// Load the full UNet2DConditionModel from a diffusers `unet/*.safetensors` file.
 /// Set `half` when pointing at a `*.fp16.safetensors` file.
-pub fn load_unet<B: Backend>(path: &str, half: bool, device: &B::Device) -> Result<Unet<B>, String> {
+pub fn load_unet<B: Backend>(
+    path: &str,
+    half: bool,
+    device: &B::Device,
+) -> Result<Unet<B>, String> {
     let base = from_adapter(SafetensorsStore::from_file(path).allow_partial(true), half);
     finish_unet(unet_remaps(base), device)
 }
@@ -82,7 +86,10 @@ pub fn load_unet_bytes<B: Backend>(
     finish_unet(unet_remaps(base), device)
 }
 
-fn finish_unet<B: Backend>(mut store: SafetensorsStore, device: &B::Device) -> Result<Unet<B>, String> {
+fn finish_unet<B: Backend>(
+    mut store: SafetensorsStore,
+    device: &B::Device,
+) -> Result<Unet<B>, String> {
     let mut model = Unet::new(device);
     let result = model
         .load_from(&mut store)
@@ -112,7 +119,7 @@ pub fn load_submodule<B: Backend, M: Module<B>>(
     let escaped = prefix.replace('.', "\\.");
     let mut store = SafetensorsStore::from_file(path)
         .with_from_adapter(PyTorchToBurnAdapter)
-        .with_key_remapping(&format!("^{escaped}"), "")
+        .with_key_remapping(format!("^{escaped}"), "")
         .with_key_remapping(r"\.ff\.net\.0\.proj\.", ".ff.proj_in.")
         .with_key_remapping(r"\.ff\.net\.2\.", ".ff.proj_out.")
         .allow_partial(true);

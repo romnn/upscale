@@ -8,6 +8,12 @@
 //!     cargo run --release -p sd-upscale --features wgpu --example upscale -- \
 //!         [input.png] [out.png] [crop] [steps] [noise_level]
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test/example code fails loudly by design"
+)]
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
 use sd_upscale::pipeline::{UpscaleOptions, Upscaler};
@@ -31,17 +37,28 @@ fn main() {
 
     // Opt in to the smaller fp16 weights with `SD_FP16=1` (up-converted to f32).
     let half = std::env::var("SD_FP16").is_ok_and(|v| v != "0");
-    let suffix = if half { "fp16.safetensors" } else { "safetensors" };
+    let suffix = if half {
+        "fp16.safetensors"
+    } else {
+        "safetensors"
+    };
     eprintln!(
         "loading models ({} UNet + VAE)…",
-        if half { "fp16→f32, ~1GB" } else { "f32, ~2GB" }
+        if half {
+            "fp16→f32, ~1GB"
+        } else {
+            "f32, ~2GB"
+        }
     );
     let t = Instant::now();
-    let unet_bytes =
-        std::fs::read(format!("{home}/{SNAP}/unet/diffusion_pytorch_model.{suffix}"))
-            .expect("read unet");
-    let vae_bytes = std::fs::read(format!("{home}/{SNAP}/vae/diffusion_pytorch_model.{suffix}"))
-        .expect("read vae");
+    let unet_bytes = std::fs::read(format!(
+        "{home}/{SNAP}/unet/diffusion_pytorch_model.{suffix}"
+    ))
+    .expect("read unet");
+    let vae_bytes = std::fs::read(format!(
+        "{home}/{SNAP}/vae/diffusion_pytorch_model.{suffix}"
+    ))
+    .expect("read vae");
     let embed_bytes = include_bytes!("../assets/empty_prompt_embed.safetensors");
     let up = Upscaler::<Wgpu>::load_full(&unet_bytes, &vae_bytes, embed_bytes, half, device)
         .expect("load_full");
@@ -54,7 +71,11 @@ fn main() {
     let tile = image::imageops::crop_imm(&img, cx, cy, crop.min(iw), crop.min(ih)).to_image();
     let (w, h) = (tile.width() as usize, tile.height() as usize);
     let rgba = tile.into_raw();
-    eprintln!("upscaling {w}x{h} → {}x{} ({steps} steps, noise {noise_level})…", w * 4, h * 4);
+    eprintln!(
+        "upscaling {w}x{h} → {}x{} ({steps} steps, noise {noise_level})…",
+        w * 4,
+        h * 4
+    );
 
     let opts = UpscaleOptions {
         steps,
@@ -63,13 +84,9 @@ fn main() {
         overlap: 16,
     };
     let t = Instant::now();
-    let (out, ow, oh) = pollster::block_on(up.upscale_rgba(
-        &rgba,
-        w,
-        h,
-        &opts,
-        &mut |p| eprint!("\r  {:.0}%   ", p * 100.0),
-    ))
+    let (out, ow, oh) = pollster::block_on(up.upscale_rgba(&rgba, w, h, &opts, &mut |p| {
+        eprint!("\r  {:.0}%   ", p * 100.0)
+    }))
     .expect("upscale");
     eprintln!("\n  done in {:.1}s", t.elapsed().as_secs_f32());
 

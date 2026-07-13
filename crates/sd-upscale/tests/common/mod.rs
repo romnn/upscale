@@ -5,6 +5,12 @@
 //! the GPU — orders of magnitude faster than CPU conv, and for wgpu it also
 //! proves the target backend actually supports every op we use.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test/example code fails loudly by design"
+)]
 use burn::tensor::backend::Backend;
 use burn::tensor::{ElementConversion, Tensor, TensorData};
 use safetensors::SafeTensors;

@@ -5,6 +5,12 @@
 //!
 //! Requires the pretrained UNet (`SD_X4_UNET`, or the default HF cache path).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test/example code fails loudly by design"
+)]
 mod common;
 
 use common::{rel_l2, tensor_from, test_device, TestBackend as B};
@@ -38,6 +44,7 @@ fn check(name: &str, err: f32) {
     assert!(err < 2e-2, "{name} diverged: rel_l2 = {err:.3e}");
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn time_embedding_matches() {
     let device = test_device();
@@ -53,6 +60,7 @@ fn time_embedding_matches() {
     check("time_embedding", rel_l2::<B, 2>(out, expected));
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn class_embedding_matches() {
     let device = test_device();
@@ -67,6 +75,7 @@ fn class_embedding_matches() {
     check("class_embedding", rel_l2::<B, 2>(out, expected));
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn resnet0_matches() {
     let device = test_device();
@@ -86,6 +95,7 @@ fn resnet0_matches() {
     check("resnet0", rel_l2::<B, 4>(out, expected));
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn transformer2d_matches() {
     let device = test_device();
@@ -104,6 +114,7 @@ fn transformer2d_matches() {
     check("transformer2d", rel_l2::<B, 4>(out, expected));
 }
 
+#[ignore = "requires local model weights/fixtures + GPU; run with: cargo test --features wgpu -- --include-ignored"]
 #[test]
 fn full_unet_matches() {
     let device = test_device();
