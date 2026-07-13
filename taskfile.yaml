@@ -35,6 +35,23 @@ tasks:
     cmds:
       - cargo test --doc {{.CLI_ARGS}}
 
+  web:serve:
+    desc: "serve the webapp with hot reload (trunk dev server on :8080)"
+    dir: crates/web
+    cmds:
+      - trunk serve {{.CLI_ARGS}}
+
+  web:models:
+    desc: "static-serve crates/web/models/ for the trunk proxy (see crates/web/README.md)"
+    dir: crates/web
+    cmds:
+      - python3 -m http.server 8787
+
+  web:dev:
+    desc: "run the whole webapp dev loop in one command: hot-reload server + model file server"
+    aliases: [dev]
+    deps: [web:serve, web:models]
+
   lint:ast-grep:
     desc: "lint with ast-grep rules"
     cmds:

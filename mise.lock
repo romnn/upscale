@@ -158,6 +158,10 @@ checksum = "sha256:82ff1207be9e9533267b83dbe33d0b16b30043f116dc336d9a526667fa276
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/cargo-zigbuild-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/450974351"
 
+[[tools."github:trunk-rs/trunk"]]
+version = "0.21.14"
+backend = "github:trunk-rs/trunk"
+
 [[tools.task]]
 version = "3.52.0"
 backend = "aqua:go-task/task"
