@@ -53,6 +53,7 @@ pub struct TimestepEmbedding<B: Backend> {
 }
 
 impl<B: Backend> TimestepEmbedding<B> {
+    /// Builds the two-layer MLP: `freq_dim -> time_dim -> time_dim`.
     pub fn new(freq_dim: usize, time_dim: usize, device: &B::Device) -> Self {
         Self {
             linear_1: LinearConfig::new(freq_dim, time_dim).init(device),
@@ -80,6 +81,9 @@ pub struct ResnetBlockTemb<B: Backend> {
 }
 
 impl<B: Backend> ResnetBlockTemb<B> {
+    /// Builds a block mapping `in_ch` -> `out_ch`, projecting the `time_dim`
+    /// embedding onto the `out_ch` feature map. A 1x1 shortcut conv is added
+    /// only when the channel count changes.
     pub fn new(in_ch: usize, out_ch: usize, time_dim: usize, device: &B::Device) -> Self {
         let conv_shortcut = (in_ch != out_ch).then(|| {
             Conv2dConfig::new([in_ch, out_ch], [1, 1])
@@ -131,6 +135,9 @@ pub struct Attention<B: Backend> {
 }
 
 impl<B: Backend> Attention<B> {
+    /// Builds attention projecting queries from `query_dim` and keys/values from
+    /// `context_dim`. For self-attention pass `context_dim == query_dim`; the
+    /// inner dimension equals `query_dim`, split across `HEADS` heads.
     pub fn new(query_dim: usize, context_dim: usize, device: &B::Device) -> Self {
         let inner = query_dim; // inner_dim = heads * head_dim = query_dim here
         Self {
@@ -184,6 +191,8 @@ pub struct FeedForward<B: Backend> {
 }
 
 impl<B: Backend> FeedForward<B> {
+    /// Builds a GEGLU FF over `dim` with hidden width `dim * mult`. `proj_in`
+    /// emits twice that width (value and gate halves); `proj_out` maps back.
     pub fn new(dim: usize, mult: usize, device: &B::Device) -> Self {
         let inner = dim * mult;
         Self {
@@ -192,6 +201,8 @@ impl<B: Backend> FeedForward<B> {
         }
     }
 
+    /// GEGLU: split `proj_in` into value and gate halves, gate the value by
+    /// `gelu(gate)`, then `proj_out`. Shape-preserving on the feature dim.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let h = self.proj_in.forward(x); // [B,N,2*inner]
         let inner = h.dims()[2] / 2;
@@ -216,6 +227,9 @@ pub struct BasicTransformerBlock<B: Backend> {
 }
 
 impl<B: Backend> BasicTransformerBlock<B> {
+    /// Builds a transformer block over `dim`. When `only_cross_attention` is
+    /// set, `attn1` cross-attends to the `CROSS_DIM` context (rather than
+    /// self-attending), matching the checkpoint's per-stage flags.
     pub fn new(dim: usize, only_cross_attention: bool, device: &B::Device) -> Self {
         let attn1_context = if only_cross_attention { CROSS_DIM } else { dim };
         Self {
@@ -229,6 +243,8 @@ impl<B: Backend> BasicTransformerBlock<B> {
         }
     }
 
+    /// `x`: `[B, N, dim]`, `context`: `[B, M, CROSS_DIM]`. Runs attn1, cross-attn2,
+    /// and the GEGLU FF, each pre-normed and residually added.
     pub fn forward(&self, x: Tensor<B, 3>, context: Tensor<B, 3>) -> Tensor<B, 3> {
         let n1 = self.norm1.forward(x.clone());
         let ctx1 = if self.only_cross_attention {
@@ -257,6 +273,8 @@ pub struct Transformer2D<B: Backend> {
 }
 
 impl<B: Backend> Transformer2D<B> {
+    /// Builds a `channels`-wide transformer with `num_blocks` stacked
+    /// [`BasicTransformerBlock`]s, all sharing `only_cross_attention`.
     pub fn new(
         channels: usize,
         num_blocks: usize,
@@ -275,6 +293,9 @@ impl<B: Backend> Transformer2D<B> {
         }
     }
 
+    /// Norm, flatten the spatial grid to `[B, H·W, C]`, run the transformer
+    /// blocks against `context`, project back, and add the input residual.
+    /// Shape-preserving (`[N, C, H, W]` in and out).
     pub fn forward(&self, x: Tensor<B, 4>, context: Tensor<B, 3>) -> Tensor<B, 4> {
         let [b, c, h, w] = x.dims();
         let residual = x.clone();
@@ -324,6 +345,7 @@ pub struct Downsample2D<B: Backend> {
 }
 
 impl<B: Backend> Downsample2D<B> {
+    /// Builds a `channels -> channels` strided downsampler.
     pub fn new(channels: usize, device: &B::Device) -> Self {
         Self {
             conv: Conv2dConfig::new([channels, channels], [3, 3])
@@ -333,6 +355,7 @@ impl<B: Backend> Downsample2D<B> {
         }
     }
 
+    /// Stride-2 3x3 conv: `[N, C, H, W]` -> `[N, C, H/2, W/2]`.
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         self.conv.forward(x)
     }

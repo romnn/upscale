@@ -26,12 +26,14 @@ pub fn group_norm<B: Backend>(
         .init(device)
 }
 
+/// Shape-preserving 3x3 conv (`padding=1`), the workhorse conv of the VAE/UNet.
 pub fn conv3x3<B: Backend>(in_ch: usize, out_ch: usize, device: &B::Device) -> Conv2d<B> {
     Conv2dConfig::new([in_ch, out_ch], [3, 3])
         .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
         .init(device)
 }
 
+/// 1x1 conv (`padding=0`), a per-pixel channel projection used for shortcuts.
 pub fn conv1x1<B: Backend>(in_ch: usize, out_ch: usize, device: &B::Device) -> Conv2d<B> {
     Conv2dConfig::new([in_ch, out_ch], [1, 1])
         .with_padding(PaddingConfig2d::Explicit(0, 0, 0, 0))
@@ -49,6 +51,9 @@ pub struct ResnetBlock2D<B: Backend> {
 }
 
 impl<B: Backend> ResnetBlock2D<B> {
+    /// Builds a block mapping `in_ch` -> `out_ch` channels, with `groups`/`eps`
+    /// for both GroupNorms. A 1x1 shortcut conv is added only when the channel
+    /// count changes; otherwise the residual is the input itself.
     pub fn new(in_ch: usize, out_ch: usize, groups: usize, eps: f64, device: &B::Device) -> Self {
         let conv_shortcut = (in_ch != out_ch).then(|| conv1x1(in_ch, out_ch, device));
         Self {
@@ -60,6 +65,9 @@ impl<B: Backend> ResnetBlock2D<B> {
         }
     }
 
+    /// Applies `norm -> SiLU -> conv` twice, then adds the (optionally
+    /// projected) residual. Shape-preserving except for the channel remap:
+    /// `[N, in_ch, H, W]` -> `[N, out_ch, H, W]`.
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let h = self.conv1.forward(silu(self.norm1.forward(x.clone())));
         let h = self.conv2.forward(silu(self.norm2.forward(h)));
@@ -84,6 +92,9 @@ pub struct AttnBlock<B: Backend> {
 }
 
 impl<B: Backend> AttnBlock<B> {
+    /// Builds a single-head self-attention over `channels`, with `groups`/`eps`
+    /// for the pre-norm. Query/key/value/output projections are all
+    /// `channels -> channels`.
     pub fn new(channels: usize, groups: usize, eps: f64, device: &B::Device) -> Self {
         Self {
             group_norm: group_norm(groups, channels, eps, device),
@@ -95,6 +106,9 @@ impl<B: Backend> AttnBlock<B> {
         }
     }
 
+    /// Flattens the spatial grid to a length-`H·W` sequence, applies scaled
+    /// dot-product self-attention, and adds the input residual. Shape-preserving
+    /// (`[N, C, H, W]` in and out).
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let [b, c, h, w] = x.dims();
         let residual = x.clone();
@@ -127,12 +141,15 @@ pub struct Upsample2D<B: Backend> {
 }
 
 impl<B: Backend> Upsample2D<B> {
+    /// Builds a `channels -> channels` upsampler (channel count is unchanged).
     pub fn new(channels: usize, device: &B::Device) -> Self {
         Self {
             conv: conv3x3(channels, channels, device),
         }
     }
 
+    /// Nearest-neighbour 2x upsample then a 3x3 conv:
+    /// `[N, C, H, W]` -> `[N, C, 2H, 2W]`.
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let [_, _, h, w] = x.dims();
         let x = interpolate(

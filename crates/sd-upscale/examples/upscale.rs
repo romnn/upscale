@@ -85,7 +85,7 @@ fn main() {
     };
     let t = Instant::now();
     let (out, ow, oh) = pollster::block_on(up.upscale_rgba(&rgba, w, h, &opts, &mut |p| {
-        eprint!("\r  {:.0}%   ", p * 100.0)
+        eprint!("\r  {:.0}%   ", p * 100.0);
     }))
     .expect("upscale");
     eprintln!("\n  done in {:.1}s", t.elapsed().as_secs_f32());

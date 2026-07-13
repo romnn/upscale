@@ -81,8 +81,8 @@ pub async fn decode_blob_to_rgba(blob: &web_sys::Blob) -> Result<ImageBuf, Strin
 /// `<img src>` preview and an `<a download>` link.
 pub fn rgba_to_data_url(rgba: &[u8], width: u32, height: u32) -> Result<String, String> {
     let (canvas, ctx) = new_canvas(width, height)?;
-    let mut data = rgba.to_vec();
-    let image_data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&mut data), width, height)
+    let data = rgba.to_vec();
+    let image_data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&data), width, height)
         .map_err(js_err)?;
     ctx.put_image_data(&image_data, 0.0, 0.0).map_err(js_err)?;
     canvas.to_data_url_with_type("image/png").map_err(js_err)

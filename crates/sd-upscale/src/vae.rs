@@ -17,10 +17,13 @@ const EPS: f64 = 1e-6;
 /// Geometry of the x4-upscaler VAE decoder.
 #[derive(Clone, Debug)]
 pub struct VaeConfig {
+    /// Channels in the latent the decoder consumes (4 for SD).
     pub latent_channels: usize,
+    /// Channels in the decoded image (3 for RGB).
     pub out_channels: usize,
     /// Encoder-order channels; the decoder walks these reversed.
     pub block_out_channels: Vec<usize>,
+    /// Resnet layers per up-block; the decoder adds one extra per block.
     pub layers_per_block: usize,
 }
 
@@ -167,10 +170,15 @@ impl<B: Backend> Decoder<B> {
 /// `python/dump_vae_fixture.py` so a parity test can localise a divergence.
 #[derive(Clone, Debug)]
 pub struct VaeTrace<B: Backend> {
+    /// After the decoder input conv (`conv_in`).
     pub out_conv_in: Tensor<B, 4>,
+    /// After the mid block (resnet -> attention -> resnet).
     pub out_mid: Tensor<B, 4>,
+    /// After each up-block, in decoder order.
     pub out_up: Vec<Tensor<B, 4>>,
+    /// After the final `GroupNorm`, before the output SiLU.
     pub out_norm: Tensor<B, 4>,
+    /// The decoded image (after the final conv).
     pub output: Tensor<B, 4>,
 }
 
@@ -182,6 +190,8 @@ pub struct VaeDecoder<B: Backend> {
 }
 
 impl<B: Backend> VaeDecoder<B> {
+    /// Builds the decoder from `config`: the `post_quant_conv` plus the decoder
+    /// stack (input conv, mid block, up blocks, output norm/conv).
     pub fn new(config: &VaeConfig, device: &B::Device) -> Self {
         Self {
             post_quant_conv: conv1x1(config.latent_channels, config.latent_channels, device),

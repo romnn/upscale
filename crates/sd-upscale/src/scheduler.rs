@@ -45,6 +45,9 @@ pub struct DdimScheduler {
 }
 
 impl DdimScheduler {
+    /// Builds the scheduler and defaults to the full `NUM_TRAIN_TIMESTEPS`
+    /// schedule; call [`set_timesteps`](Self::set_timesteps) to pick the
+    /// inference step count.
     pub fn new() -> Self {
         let alphas_cumprod = alphas_cumprod();
         // `set_alpha_to_one=false`: final_alpha_cumprod = alphas_cumprod[0].
@@ -72,10 +75,14 @@ impl DdimScheduler {
             .collect();
     }
 
+    /// The descending diffusion timesteps to iterate over, as set by the most
+    /// recent [`set_timesteps`](Self::set_timesteps).
     pub fn timesteps(&self) -> &[i64] {
         &self.timesteps
     }
 
+    /// Initial-latent scaling factor (always `1.0` for this scheduler), applied
+    /// to the sampled Gaussian noise before the first step.
     pub fn init_noise_sigma(&self) -> f32 {
         1.0
     }
@@ -132,6 +139,7 @@ pub struct LowResNoiser {
 }
 
 impl LowResNoiser {
+    /// Builds the noiser over the shared `scaled_linear` alpha schedule.
     pub fn new() -> Self {
         Self {
             alphas_cumprod: alphas_cumprod(),
