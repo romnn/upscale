@@ -1,0 +1,6 @@
+/target
+/dist
+# Symlinks to local model checkpoints (see README.md "Dev model serving") —
+# never meant to be committed, and the multi-GB targets don't exist outside
+# this machine's HF cache anyway.
+/models/*.safetensors

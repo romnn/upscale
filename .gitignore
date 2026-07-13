@@ -1,0 +1,9 @@
+/target
+
+# Golden-tensor test fixtures (~27 MB) are derived artifacts: regenerate with
+# `crates/sd-upscale/python/dump_*_fixture.py`. The parity tests that consume
+# them also need the (uncommitted) model weights from the local HF cache, so
+# there's no point committing the fixtures — a fresh clone needs local setup
+# either way. The tiny `assets/empty_prompt_embed.safetensors` is NOT ignored:
+# it's `include_bytes!`'d into the binary, so it's a required build input.
+/crates/sd-upscale/tests/fixtures/*.safetensors

@@ -1,0 +1,79 @@
+# Deliberately its own workspace (not a member of the parent `../../Cargo.toml`):
+# this crate builds for wasm32-unknown-unknown with a very different dependency
+# set (leptos, web-sys, wasm-bindgen) and the parent workspace's native
+# CPU/CUDA test harness should never have to re-resolve/rebuild for wasm.
+[workspace]
+
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+log = "0.4"
+console_log = "1"
+console_error_panic_hook = "0.1"
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+sd-upscale = { path = "../sd-upscale", features = ["wgpu"] }
+# Only for the `Wgpu`/`WgpuDevice`/async-setup types used directly by
+# `src/gpu.rs` and `src/app.rs` — kept version- and feature-aligned with
+# `sd-upscale`'s own `burn` dependency so both resolve to the same instance.
+burn = { version = "0.21", default-features = false, features = ["wgpu"] }
+
+# `rand`/`getrandom` (pulled in transitively by burn-backend, for the wgpu
+# tuner/rng) needs the `wasm_js` backend feature enabled to compile at all
+# for wasm32-unknown-unknown. This direct dependency exists purely to
+# feature-unify with the transitive `getrandom 0.4.x` burn resolves to — see
+# crates/web/README.md.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",
+  "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "HtmlCanvasElement",
+  "HtmlImageElement",
+  "HtmlInputElement",
+  "HtmlAnchorElement",
+  "CanvasRenderingContext2d",
+  "ImageData",
+  "ImageBitmap",
+  "ImageBitmapOptions",
+  "File",
+  "FileList",
+  "FileReader",
+  "Blob",
+  "BlobPropertyBag",
+  "Url",
+  "DragEvent",
+  "DataTransfer",
+  "Navigator",
+  "Gpu",
+  "Cache",
+  "CacheStorage",
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "Response",
+  "ResponseInit",
+  "Headers",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "ReadableStreamGetReaderOptions",
+  "ReadableStreamReaderMode",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true

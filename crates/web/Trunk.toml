@@ -1,0 +1,17 @@
+# See README.md "Dev model serving" for why /models is proxied rather than
+# copied into dist: the VAE safetensors is ~212 MB and copying it on every
+# `trunk build`/`trunk serve` rebuild would be slow and wasteful. Instead run
+# a plain static file server for `crates/web/models/` (e.g. `python3 -m
+# http.server`) and trunk's dev server proxies `/models/*` to it.
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+ignore = ["models", "dist"]
+
+[serve]
+port = 8080
+
+[[proxy]]
+backend = "http://127.0.0.1:8787/models/"

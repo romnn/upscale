@@ -1,0 +1,33 @@
+[package]
+name = "sd-upscale"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Stable Diffusion x4 latent-diffusion upscaler, ported to burn (backend-agnostic: CPU / CUDA / wgpu)."
+
+[dependencies]
+# Backend-agnostic model. A concrete backend is chosen by the binary/test via a
+# feature below; the library itself is generic over `burn::tensor::backend::Backend`.
+burn = { workspace = true, features = ["std"] }
+burn-store = { workspace = true, features = ["std", "safetensors"] }
+# Reading the precomputed prompt-embedding tensor from bytes (pure Rust, wasm-ok).
+safetensors = "0.4"
+
+[dev-dependencies]
+# Tests run on the CPU (NdArray) backend so `cargo test` works with no GPU/toolkit.
+burn = { workspace = true, features = ["std", "ndarray"] }
+# PNG I/O for the native `upscale` example (real end-to-end smoke test on wgpu).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Drive the async `upscale_rgba` future to completion on native (WASM uses the
+# browser event loop instead).
+pollster = "0.4"
+
+[[example]]
+name = "upscale"
+required-features = ["wgpu"]
+
+[features]
+default = []
+ndarray = ["burn/ndarray"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]

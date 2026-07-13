@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/sd-upscale"]
+# The wasm/wgpu frontend (crates/web) joins the workspace once the core model
+# ports cleanly; until then plain `cargo test` stays on the native backends.
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+burn = { version = "0.21", default-features = false }
+burn-store = { version = "0.21", default-features = false }
+
+# Compile dependencies optimized even in dev/test: burn + ndarray conv/matmul are
+# unusably slow at opt-level 0, while keeping our own crates unoptimized for fast
+# incremental rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
