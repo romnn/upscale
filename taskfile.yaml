@@ -36,7 +36,7 @@ tasks:
       - cargo test --doc {{.CLI_ARGS}}
 
   web:serve:
-    desc: "serve the webapp with hot reload (trunk dev server on :8080)"
+    desc: "serve the webapp with hot reload (trunk dev server on :8788)"
     dir: crates/web
     cmds:
       - trunk serve {{.CLI_ARGS}}
