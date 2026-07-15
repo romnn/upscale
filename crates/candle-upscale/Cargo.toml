@@ -1,0 +1,36 @@
+[package]
+name = "candle-upscale"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "CUDA-native candle port of the SD x4 latent-diffusion upscaler, run side-by-side with the burn reference to benchmark."
+publish = false
+
+[lints]
+workspace = true
+
+# The `cuda` feature needs the CUDA toolkit, which CI / cross-target lint lacks.
+# Without it the crate still compiles against candle's CPU backend, so `clippy`
+# and the feature-combo matrix cover the model code with no GPU present.
+[package.metadata.cargo-fc]
+exclude_features = ["cuda"]
+
+[dependencies]
+# candle 0.10 is what `burn-candle` already locks into this workspace, so pinning
+# it here unifies to a single `candle-core` (one kernel build) rather than a
+# second, duplicate version. The `cuda` feature (default) turns on GPU kernels;
+# without it candle falls back to CPU so the crate builds toolkit-free.
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+
+[features]
+default = ["cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[dev-dependencies]
+# PNG I/O for the parity example (loads a real image crop, writes the output).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[example]]
+name = "parity_candle"
+required-features = ["cuda"]

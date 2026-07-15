@@ -33,6 +33,11 @@ pollster = "0.4"
 name = "upscale"
 required-features = ["wgpu"]
 
+# Burn side of the burn-vs-candle parity harness; needs the CUDA backend.
+[[example]]
+name = "parity_burn"
+required-features = ["cuda"]
+
 [features]
 default = []
 ndarray = ["burn/ndarray"]

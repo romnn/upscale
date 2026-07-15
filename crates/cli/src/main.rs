@@ -38,6 +38,16 @@ enum BackendChoice {
     Cuda,
 }
 
+/// Which implementation runs the diffusion model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum EngineChoice {
+    /// The reference burn implementation (backend-agnostic: wgpu or CUDA).
+    Burn,
+    /// The CUDA-native candle port. Requires a build with `--features candle`
+    /// and a CUDA device; `--backend` is ignored (candle is always CUDA).
+    Candle,
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DtypeChoice {
     /// Full fp32 compute — matches the browser/reference output exactly.
@@ -47,6 +57,17 @@ enum DtypeChoice {
     /// VAE needs to avoid overflow. Backend support varies (works on CUDA; wgpu
     /// may lack it).
     Bf16,
+}
+
+#[cfg(feature = "candle")]
+impl DtypeChoice {
+    /// Short label for logs (`f32` / `bf16`).
+    fn as_str(self) -> &'static str {
+        match self {
+            DtypeChoice::F32 => "f32",
+            DtypeChoice::Bf16 => "bf16",
+        }
+    }
 }
 
 /// Output upscale factor.
@@ -70,11 +91,17 @@ struct Args {
     /// Input image (PNG or JPEG).
     #[arg(short, long)]
     input: PathBuf,
-    /// Output PNG path.
+    /// Output path. PNG or JPEG, chosen by the file extension.
     #[arg(short, long, default_value = "upscaled.png")]
     output: PathBuf,
+    /// Inference engine. `burn` (default) is the reference implementation;
+    /// `candle` is the CUDA-native port (needs `--features candle`, ignores
+    /// `--backend`), built to benchmark candle against burn on CUDA.
+    #[arg(long, value_enum, default_value = "burn")]
+    engine: EngineChoice,
     /// Compute backend. `auto` (default) prefers CUDA when available, else wgpu;
-    /// `cuda` requires a build with `--features cuda`.
+    /// `cuda` requires a build with `--features cuda`. Ignored for
+    /// `--engine candle`.
     #[arg(long, value_enum, default_value = "auto")]
     backend: BackendChoice,
     /// Compute precision. Defaults to `bf16` on CUDA (tensor cores, much faster,
@@ -182,6 +209,52 @@ fn progress_bar(quiet: bool) -> anyhow::Result<Option<ProgressBar>> {
     Ok(Some(pb))
 }
 
+/// Load the input image and apply the engine-agnostic preprocessing: optional
+/// center-crop, then (for `--scale 2`) an up-front ×2 downsample so the native
+/// ×4 pass lands at ×2. Returns RGBA8 bytes plus width/height.
+fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
+    let img = image::open(&args.input)
+        .with_context(|| format!("open input {}", args.input.display()))?
+        .to_rgba8();
+    let img = match args.crop {
+        Some(c) => center_crop(img, c),
+        None => img,
+    };
+    let img = match args.scale {
+        ScaleChoice::Four => img,
+        ScaleChoice::Two => {
+            let (iw, ih) = (img.width(), img.height());
+            let (dw, dh) = ((iw / 2).max(1), (ih / 2).max(1));
+            if !args.quiet {
+                eprintln!("×2 mode: downsampling input {iw}×{ih} → {dw}×{dh} before the ×4 pass");
+            }
+            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3)
+        }
+    };
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    Ok((img.into_raw(), w, h))
+}
+
+/// Write the upscaled RGBA8 buffer to `--output` (PNG or JPEG, by extension).
+///
+/// JPEG can't encode an alpha channel, so the alpha is dropped for JPEG output —
+/// the upscaled image is fully opaque, so nothing is lost.
+fn write_output(args: &Args, out: Vec<u8>, ow: usize, oh: usize) -> anyhow::Result<()> {
+    let img =
+        image::RgbaImage::from_raw(ow as u32, oh as u32, out).context("assemble output image")?;
+    match image::ImageFormat::from_path(&args.output) {
+        Ok(image::ImageFormat::Jpeg) => image::DynamicImage::ImageRgba8(img)
+            .into_rgb8()
+            .save(&args.output),
+        _ => img.save(&args.output),
+    }
+    .with_context(|| format!("write output {}", args.output.display()))?;
+    if !args.quiet {
+        eprintln!("wrote {} ({ow}×{oh})", args.output.display());
+    }
+    Ok(())
+}
+
 /// Backend-generic pipeline run: load the models, upscale the input, write the
 /// output.
 ///
@@ -212,28 +285,7 @@ fn run<B: Backend>(device: B::Device, args: &Args, weight_dtype: FloatDType) -> 
         eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
     }
 
-    let img = image::open(&args.input)
-        .with_context(|| format!("open input {}", args.input.display()))?
-        .to_rgba8();
-    let img = match args.crop {
-        Some(c) => center_crop(img, c),
-        None => img,
-    };
-    // For ×2 output, downsample the input ×2 up front so the native ×4 pass lands
-    // at ×2 of the original while processing a quarter of the pixels.
-    let img = match args.scale {
-        ScaleChoice::Four => img,
-        ScaleChoice::Two => {
-            let (iw, ih) = (img.width(), img.height());
-            let (dw, dh) = ((iw / 2).max(1), (ih / 2).max(1));
-            if !quiet {
-                eprintln!("×2 mode: downsampling input {iw}×{ih} → {dw}×{dh} before the ×4 pass");
-            }
-            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3)
-        }
-    };
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let rgba = img.into_raw();
+    let (rgba, w, h) = prepare_input(args)?;
 
     let opts = UpscaleOptions {
         steps: args.steps,
@@ -272,14 +324,7 @@ fn run<B: Backend>(device: B::Device, args: &Args, weight_dtype: FloatDType) -> 
         eprintln!("  done in {:.1}s", t.elapsed().as_secs_f32());
     }
 
-    image::RgbaImage::from_raw(ow as u32, oh as u32, out)
-        .context("assemble output image")?
-        .save(&args.output)
-        .with_context(|| format!("write output {}", args.output.display()))?;
-    if !quiet {
-        eprintln!("wrote {} ({ow}×{oh})", args.output.display());
-    }
-    Ok(())
+    write_output(args, out, ow, oh)
 }
 
 fn run_wgpu(args: &Args, dtype: DtypeChoice) -> anyhow::Result<()> {
@@ -400,8 +445,96 @@ fn cuda_available() -> bool {
     false
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+/// Fixed seed for the candle engine's per-tile noise, so a candle run is
+/// reproducible (the burn engine draws fresh noise per tile instead).
+#[cfg(feature = "candle")]
+const CANDLE_SEED: u64 = 0x5D5C_A1E0;
+
+/// The CUDA-native candle engine: mirrors [`run`], but uses candle's own device
+/// and pipeline. Candle is always CUDA, so `--backend` is ignored; `--dtype`
+/// defaults to bf16 (tensor cores) as on the burn CUDA path.
+#[cfg(feature = "candle")]
+fn run_candle(args: &Args, dtype: DtypeChoice) -> anyhow::Result<()> {
+    use candle_upscale::{DType, UpscaleOptions as CandleOptions, Upscaler as CandleUpscaler};
+
+    let quiet = args.quiet;
+    if !quiet {
+        eprintln!("engine: candle (cuda, {})", dtype.as_str());
+    }
+    let cdtype = match dtype {
+        DtypeChoice::F32 => DType::F32,
+        DtypeChoice::Bf16 => DType::BF16,
+    };
+    let device = candle_upscale::cuda_device()
+        .map_err(|e| anyhow!("open CUDA device for candle engine: {e}"))?;
+
+    let (unet_path, vae_path) = args.model_paths();
+    if !quiet {
+        eprintln!(
+            "loading models ({}): {} + {}",
+            if args.fp16 {
+                "fp16→compute"
+            } else {
+                "f32→compute"
+            },
+            unet_path.display(),
+            vae_path.display(),
+        );
+    }
+    let t = Instant::now();
+    let up = CandleUpscaler::load(&unet_path, &vae_path, EMPTY_PROMPT_EMBED, device, cdtype)
+        .map_err(|e| anyhow!("load models (candle): {e}"))?;
+    if !quiet {
+        eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
+    }
+
+    let (rgba, w, h) = prepare_input(args)?;
+    let opts = CandleOptions {
+        steps: args.steps,
+        noise_level: args.noise_level,
+        tile: args.tile,
+        overlap: args.overlap,
+        batch: args.batch,
+    };
+    let prec = dtype.as_str();
+    if !quiet {
+        eprintln!(
+            "upscaling {w}x{h} → {}x{} ({} steps, noise {}, {prec}, candle)…",
+            w * 4,
+            h * 4,
+            args.steps,
+            args.noise_level,
+        );
+    }
+
+    let pb = progress_bar(quiet)?;
+    let t = Instant::now();
+    let (out, ow, oh) = up
+        .upscale_rgba(&rgba, w, h, &opts, CANDLE_SEED, &mut |p| {
+            if let Some(pb) = &pb {
+                pb.set_position((p * PROGRESS_LEN as f32).round() as u64);
+            }
+        })
+        .map_err(|e| anyhow!("upscale (candle): {e}"))?;
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+    if !quiet {
+        eprintln!("  done in {:.1}s", t.elapsed().as_secs_f32());
+    }
+    write_output(args, out, ow, oh)
+}
+
+#[cfg(not(feature = "candle"))]
+fn run_candle(_args: &Args, _dtype: DtypeChoice) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "this binary was built without the candle engine; rebuild with `--features candle`"
+    )
+}
+
+/// Run the reference burn engine: resolve `auto` backend, pick a precision, and
+/// dispatch to the wgpu or CUDA burn pipeline.
+fn run_burn(args: &Args) -> anyhow::Result<()> {
     // Resolve `auto`: prefer CUDA when this build can use it and a device exists.
     let use_cuda = match args.backend {
         BackendChoice::Cuda => true,
@@ -426,8 +559,34 @@ fn main() -> anyhow::Result<()> {
         eprintln!("backend: {}", if use_cuda { "cuda" } else { "wgpu" });
     }
     if use_cuda {
-        run_cuda(&args, dtype)
+        run_cuda(args, dtype)
     } else {
-        run_wgpu(&args, dtype)
+        run_wgpu(args, dtype)
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    // Both engines' schedulers index `alphas_cumprod` (len 1000) by step-derived
+    // timesteps and by `noise_level`. Reject inputs that would index out of bounds
+    // (a panic) or, on candle, skip denoising entirely and emit pure noise.
+    if !(1..1000).contains(&args.steps) {
+        anyhow::bail!("--steps must be in 1..=999 (got {})", args.steps);
+    }
+    if !(0..=350).contains(&args.noise_level) {
+        anyhow::bail!(
+            "--noise-level must be in 0..=350 (got {})",
+            args.noise_level
+        );
+    }
+    match args.engine {
+        EngineChoice::Burn => run_burn(&args),
+        EngineChoice::Candle => {
+            // Candle is CUDA-native; precision defaults to bf16 like the burn CUDA
+            // path, and `--backend` does not apply. The `engine:` line is announced
+            // inside `run_candle` so a non-candle build's bailing stub doesn't
+            // falsely print it.
+            run_candle(&args, args.dtype.unwrap_or(DtypeChoice::Bf16))
+        }
     }
 }

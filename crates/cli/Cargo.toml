@@ -9,10 +9,11 @@ publish = false
 [lints]
 workspace = true
 
-# `cuda` needs the CUDA toolkit, which CI / cross-target lint doesn't have. wgpu
-# is always on (the default backend), so the base config still has a backend.
+# `cuda` and `candle` both need the CUDA toolkit, which CI / cross-target lint
+# doesn't have. wgpu is always on (the default backend), so the base config still
+# has a backend.
 [package.metadata.cargo-fc]
-exclude_features = ["cuda"]
+exclude_features = ["cuda", "candle"]
 
 [[bin]]
 name = "sd-upscale"
@@ -33,7 +34,11 @@ indicatif = "0.17"
 # CUDA-only, and just for the `--backend auto` device probe (feature-unified with
 # burn-cuda's own cudarc, which supplies the cuda-version features).
 cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
+# The CUDA-native candle engine (opt-in via `--engine candle`). Pulls candle with
+# its default `cuda` feature, so this needs the CUDA toolkit to build.
+candle-upscale = { path = "../candle-upscale", optional = true }
 
 [features]
 default = []
 cuda = ["sd-upscale/cuda", "burn/cuda", "dep:cudarc"]
+candle = ["dep:candle-upscale", "candle-upscale/cuda"]
