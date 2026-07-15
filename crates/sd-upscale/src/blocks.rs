@@ -79,6 +79,15 @@ impl<B: Backend> ResnetBlock2D<B> {
     }
 }
 
+/// Query-row budget per [`AttnBlock`] score block, summed across the batch.
+///
+/// The score matrix is materialized `[B, chunk, HW]` with
+/// `chunk = ATTN_ROW_BUDGET / B`, so the block stays `~ATTN_ROW_BUDGET × HW`
+/// regardless of batch. At a 128px tile `HW = 16384`, that is ~67 MB in bf16,
+/// versus the ~1 GB a full `[B, HW, HW]` matrix would need — which the CUDA
+/// backend's allocator chokes on.
+const ATTN_ROW_BUDGET: usize = 2048;
+
 /// Spatial self-attention used in the VAE mid-block (single head, old diffusers
 /// `query`/`key`/`value`/`proj_attn` naming that this checkpoint stores on disk).
 #[derive(Module, Debug)]
@@ -121,12 +130,27 @@ impl<B: Backend> AttnBlock<B> {
         let k = self.key.forward(hidden.clone());
         let v = self.value.forward(hidden);
 
-        // single head: scale by 1/sqrt(C)
+        // Single head, scaled by 1/sqrt(C). Attend in query-row chunks so the
+        // score matrix is `[B, chunk, HW]` rather than the full `[B, HW, HW]`
+        // (see `ATTN_ROW_BUDGET`). Splitting the query rows is exact: each row's
+        // softmax runs over all keys independently.
         let scale = 1.0 / (self.channels as f64).sqrt();
-        let scores = q.matmul(k.swap_dims(1, 2)).mul_scalar(scale);
-        let probs = softmax(scores, 2);
-        let out = probs.matmul(v); // [B, HW, C]
-        let out = self.proj_attn.forward(out);
+        let n = h * w;
+        let chunk = (ATTN_ROW_BUDGET / b).max(1);
+        let kt = k.swap_dims(1, 2); // [B, C, HW]
+        let mut parts = Vec::with_capacity(n.div_ceil(chunk));
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            let scores = q
+                .clone()
+                .narrow(1, start, len)
+                .matmul(kt.clone())
+                .mul_scalar(scale);
+            parts.push(softmax(scores, 2).matmul(v.clone())); // [B, len, C]
+            start += len;
+        }
+        let out = self.proj_attn.forward(Tensor::cat(parts, 1)); // [B, HW, C]
 
         // [B, HW, C] -> [B, C, H, W]
         let out = out.swap_dims(1, 2).reshape([b, c, h, w]);
