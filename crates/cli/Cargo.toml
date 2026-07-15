@@ -1,0 +1,39 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Native CLI for the SD x4 upscaler (wgpu by default, optional CUDA)."
+publish = false
+
+[lints]
+workspace = true
+
+# `cuda` needs the CUDA toolkit, which CI / cross-target lint doesn't have. wgpu
+# is always on (the default backend), so the base config still has a backend.
+[package.metadata.cargo-fc]
+exclude_features = ["cuda"]
+
+[[bin]]
+name = "sd-upscale"
+path = "src/main.rs"
+
+[dependencies]
+# The backend-agnostic model. wgpu is always compiled so the default build needs
+# no CUDA toolkit; `--features cuda` adds the CUDA backend on top.
+sd-upscale = { path = "../sd-upscale", features = ["wgpu"] }
+burn = { workspace = true, features = ["std", "wgpu"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Drive the async `upscale_rgba` future to completion on native (the browser
+# uses its event loop instead).
+pollster = "0.4"
+anyhow = "1"
+indicatif = "0.17"
+# CUDA-only, and just for the `--backend auto` device probe (feature-unified with
+# burn-cuda's own cudarc, which supplies the cuda-version features).
+cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
+
+[features]
+default = []
+cuda = ["sd-upscale/cuda", "burn/cuda", "dep:cudarc"]

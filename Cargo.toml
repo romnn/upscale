@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sd-upscale", "crates/web"]
+members = ["crates/sd-upscale", "crates/cli", "crates/web"]
 # `web` is wasm-only, so it's excluded from `default-members`: plain native
 # `cargo`/`task check`/`task test` operate on `sd-upscale`, while `task check:fc`
 # / `task lint:fc` build `web` on wasm via its `package.metadata.cargo-fc`.
