@@ -60,7 +60,7 @@ fn main() {
     ))
     .expect("read vae");
     let embed_bytes = include_bytes!("../assets/empty_prompt_embed.safetensors");
-    let up = Upscaler::<Wgpu>::load_full(&unet_bytes, &vae_bytes, embed_bytes, half, device)
+    let up = Upscaler::<Wgpu>::load_full(unet_bytes, vae_bytes, embed_bytes, half, device)
         .expect("load_full");
     eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
 
@@ -82,6 +82,7 @@ fn main() {
         noise_level,
         tile: 128, // the model's native tile size
         overlap: 16,
+        batch: 1,
     };
     let t = Instant::now();
     let (out, ow, oh) = pollster::block_on(up.upscale_rgba(&rgba, w, h, &opts, &mut |p| {

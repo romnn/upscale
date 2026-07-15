@@ -74,13 +74,17 @@ pub fn load_unet<B: Backend>(
 }
 
 /// Load the UNet from in-memory safetensors bytes (browser path).
+///
+/// Takes the bytes by value and moves them into the store rather than copying:
+/// the fp32 UNet is ~1.76 GB, and a second copy would blow the wasm32 4 GB
+/// address space during load. The caller should not retain the bytes afterward.
 pub fn load_unet_bytes<B: Backend>(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     half: bool,
     device: &B::Device,
 ) -> Result<Unet<B>, String> {
     let base = from_adapter(
-        SafetensorsStore::from_bytes(Some(bytes.to_vec())).allow_partial(true),
+        SafetensorsStore::from_bytes(Some(bytes)).allow_partial(true),
         half,
     );
     finish_unet(unet_remaps(base), device)
@@ -167,13 +171,16 @@ pub fn load_vae_decoder<B: Backend>(
 
 /// Load the VAE decoder from in-memory safetensors bytes (browser path: fetched
 /// then cached, never a filesystem).
+///
+/// Takes the bytes by value and moves them into the store rather than copying,
+/// to keep peak wasm memory down (see [`load_unet_bytes`]).
 pub fn load_vae_decoder_bytes<B: Backend>(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     half: bool,
     device: &B::Device,
 ) -> Result<VaeDecoder<B>, String> {
     let store = vae_remaps(from_adapter(
-        SafetensorsStore::from_bytes(Some(bytes.to_vec())).allow_partial(true),
+        SafetensorsStore::from_bytes(Some(bytes)).allow_partial(true),
         half,
     ));
     finish_vae(store, device)

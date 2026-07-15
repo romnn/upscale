@@ -5,8 +5,9 @@
 //! DDIM loop of `unet(cat[latents, image]) → step`, and finally
 //! `vae.decode(latents / scaling_factor)` mapped back to `[0,1]`.
 
+use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::backend::Backend;
-use burn::tensor::{Distribution, Tensor, TensorData};
+use burn::tensor::{Distribution, FloatDType, Tensor, TensorData};
 
 use crate::scheduler::{DdimScheduler, LowResNoiser};
 use crate::unet::Unet;
@@ -29,6 +30,11 @@ pub struct UpscaleOptions {
     pub tile: usize,
     /// Tile overlap in pixels (blended to hide seams).
     pub overlap: usize,
+    /// Tiles processed per UNet/VAE forward. A single 128px tile badly
+    /// underutilizes a discrete GPU; batching stacks tiles on the batch
+    /// dimension to fill it, trading VRAM for throughput. `1` runs one tile per
+    /// forward.
+    pub batch: usize,
 }
 
 impl Default for UpscaleOptions {
@@ -38,6 +44,7 @@ impl Default for UpscaleOptions {
             noise_level: 20,
             tile: 128,
             overlap: 16,
+            batch: 1,
         }
     }
 }
@@ -74,9 +81,14 @@ impl<B: Backend> Upscaler<B> {
     /// Set `half = true` when the UNet/VAE bytes are `*.fp16.safetensors` (~half
     /// the download); they're up-converted to f32 on load, so inference is
     /// identical. The embedding is always f32.
+    ///
+    /// Takes `unet_bytes`/`vae_bytes` by value and consumes them as it loads (the
+    /// UNet first, so its ~1.76 GB frees before the VAE loads). This bounds peak
+    /// wasm memory — a retained or copied UNet buffer overflows the wasm32 4 GB
+    /// address space.
     pub fn load_full(
-        unet_bytes: &[u8],
-        vae_bytes: &[u8],
+        unet_bytes: Vec<u8>,
+        vae_bytes: Vec<u8>,
         embed_bytes: &[u8],
         half: bool,
         device: B::Device,
@@ -91,7 +103,7 @@ impl<B: Backend> Upscaler<B> {
     /// until the UNet + embedding are supplied via [`Self::load_full`]/[`Self::new`].
     /// Signature kept stable for the frontend.
     pub fn from_safetensors_bytes(vae_bytes: &[u8], device: B::Device) -> Result<Self, String> {
-        let vae = load_vae_decoder_bytes::<B>(vae_bytes, false, &device)?;
+        let vae = load_vae_decoder_bytes::<B>(vae_bytes.to_vec(), false, &device)?;
         Ok(Self {
             vae,
             unet: None,
@@ -102,6 +114,25 @@ impl<B: Backend> Upscaler<B> {
 
     fn is_full(&self) -> bool {
         self.unet.is_some() && self.text_embed.is_some()
+    }
+
+    /// Cast the loaded UNet, VAE, and text-embedding tensors to `dtype`.
+    ///
+    /// Weights load at their on-disk precision (f32), whereas the pipeline's
+    /// activations (`Tensor::random`, `rgba_to_tensor`, the embedding) follow the
+    /// backend's default float element. Running the backend in bf16/f16 for
+    /// tensor-core throughput therefore needs the weights brought to that same
+    /// element, which this does in a single pass.
+    ///
+    /// A no-op when `dtype` already matches the weights (e.g. the default f32
+    /// backend casting to f32).
+    #[must_use]
+    pub fn cast_weights(mut self, dtype: FloatDType) -> Self {
+        let mut caster = WeightCaster { dtype };
+        self.unet = self.unet.map(|unet| unet.map(&mut caster));
+        self.vae = self.vae.map(&mut caster);
+        self.text_embed = self.text_embed.map(|embed| embed.cast(dtype));
+        self
     }
 
     /// Run the DDIM denoising loop for one tile, returning the final latents.
@@ -123,6 +154,10 @@ impl<B: Backend> Upscaler<B> {
         let unet = self.unet.as_ref().expect("unet not loaded");
         #[expect(clippy::expect_used, reason = "full pipeline invariant, as above")]
         let context = self.text_embed.clone().expect("text embed not loaded");
+        // Cross-attention reshapes the context to the hidden state's batch, so
+        // it must match. The empty-prompt embedding is identical for every tile,
+        // so repeating it along the batch dim yields the expected shape.
+        let context = context.repeat_dim(0, init_latents.dims()[0]);
 
         // preprocess to [-1,1], then DDPM-noise the conditioning image once.
         let image = low_res01.mul_scalar(2.0).sub_scalar(1.0);
@@ -205,48 +240,74 @@ impl<B: Backend> Upscaler<B> {
         let ys: Vec<usize> = (0..height).step_by(stride).collect();
         let xs: Vec<usize> = (0..width).step_by(stride).collect();
         let total = (ys.len() * xs.len()).max(1);
+
+        // Every tile is exactly `th × tw`: the origin clamps back by a full
+        // `tile` at the edges, so the size is uniform (`min(tile, dim)`). That
+        // uniformity is what lets us stack tiles on the batch dim and run one
+        // forward for a whole group.
+        let (th, tw) = (tile.min(height), tile.min(width));
+        let origins: Vec<(usize, usize)> = ys
+            .iter()
+            .flat_map(|&y| {
+                let y0 = (y + tile).min(height).saturating_sub(tile);
+                xs.iter()
+                    .map(move |&x| (y0, (x + tile).min(width).saturating_sub(tile)))
+            })
+            .collect();
+        let batch = opts.batch.max(1);
         let mut done = 0;
 
-        for &y in &ys {
-            for &x in &xs {
-                let y_end = (y + tile).min(height);
-                let x_end = (x + tile).min(width);
-                let y0 = y_end.saturating_sub(tile);
-                let x0 = x_end.saturating_sub(tile);
-                let (th, tw) = (y_end - y0, x_end - x0);
+        for chunk in origins.chunks(batch) {
+            let tiles: Vec<Tensor<B, 4>> = chunk
+                .iter()
+                .map(|&(y0, x0)| full.clone().narrow(2, y0, th).narrow(3, x0, tw))
+                .collect();
+            let b = tiles.len();
+            let batch_t = Tensor::cat(tiles, 0);
+            let init = Tensor::random([b, 4, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
+            let lrn = Tensor::random([b, 3, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
+            let out_tiles = self.denoise_decode(batch_t, opts.noise_level, opts.steps, init, lrn);
 
-                let tile_t = full.clone().narrow(2, y0, th).narrow(3, x0, tw);
-                let init =
-                    Tensor::random([1, 4, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
-                let lrn =
-                    Tensor::random([1, 3, th, tw], Distribution::Normal(0.0, 1.0), &self.device);
-                let out_tile = self.denoise_decode(tile_t, opts.noise_level, opts.steps, init, lrn);
+            let [_, _, th4, tw4] = out_tiles.dims();
+            let data = out_tiles
+                .cast(FloatDType::F32)
+                .into_data_async()
+                .await
+                .map_err(|e| format!("tile readback failed: {e:?}"))?;
+            let vals = data
+                .as_slice::<f32>()
+                .map_err(|e| format!("tile readback: {e:?}"))?;
 
-                let [_, _, th4, tw4] = out_tile.dims();
-                let data = out_tile
-                    .into_data_async()
-                    .await
-                    .map_err(|e| format!("tile readback failed: {e:?}"))?;
-                let vals = data
-                    .as_slice::<f32>()
-                    .map_err(|e| format!("tile readback: {e:?}"))?;
+            let per_tile = 3 * th4 * tw4;
+            for (s, &(y0, x0)) in chunk.iter().enumerate() {
                 accumulate(
                     &mut out,
                     &mut weight,
-                    vals,
+                    &vals[s * per_tile..(s + 1) * per_tile],
                     th4,
                     tw4,
                     ow,
                     x0 * SCALE,
                     y0 * SCALE,
                 );
-
                 done += 1;
                 on_progress(done as f32 / total as f32);
             }
         }
 
         Ok((normalize_to_rgba(&out, &weight, ow, oh), ow, oh))
+    }
+}
+
+/// [`ModuleMapper`] that casts every float parameter to `dtype`, bringing
+/// f32-loaded weights to a half-precision backend's element type.
+struct WeightCaster {
+    dtype: FloatDType,
+}
+
+impl<B: Backend> ModuleMapper<B> for WeightCaster {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        param.map(|tensor| tensor.cast(self.dtype))
     }
 }
 
