@@ -120,6 +120,14 @@ including a fresh page load — both are served straight from that cache with
 you change the served model in an incompatible way and want old cached bytes
 to stop being picked up.
 
+Both the download and the cache path validate that the bytes actually look
+like a safetensors file (an 8-byte length prefix followed by a `{` JSON
+header) before use. A misconfigured file server that returns an HTML error
+page or a 404 body with a 200 status can otherwise get cached and then fail
+to parse with a cryptic `HeaderTooLarge`; instead, a bad download is rejected
+with an error that names the URL, and a previously-cached bad entry is evicted
+and re-fetched automatically, so a stale poisoned cache self-heals.
+
 ## Layout
 
 ```
