@@ -70,34 +70,27 @@ ln -sf "$snap"/unet/diffusion_pytorch_model.fp16.safetensors crates/web/models/u
 ln -sf "$snap"/vae/diffusion_pytorch_model.fp16.safetensors  crates/web/models/vae.fp16.safetensors
 ```
 
-The quickest way to run both processes is one command from the repo root:
+The whole dev stack is one command from the repo root:
 
 ```bash
-task web:dev   # trunk hot-reload server (:8788) + models file server (:8787)
+micromux       # reads the repo-root micromux.yaml
 ```
 
-`web:dev` just launches the two steps below concurrently; run them by hand in
-separate terminals instead (`task web:serve` / `task web:models`) when you want
-to watch or restart each independently:
+[micromux](https://github.com/romnn/micromux) runs both long-lived processes and
+shows their logs and health in one TUI:
 
-1. In one terminal, serve `crates/web/` (the parent of `models/`) as static
-   files on port 8787, so `http://127.0.0.1:8787/models/unet.safetensors` and
-   `.../models/vae.safetensors` resolve:
+- **`models`** — `python3 -m http.server 8787`, rooted at `crates/web/` (the
+  parent of `models/`) so `http://127.0.0.1:8787/models/unet.safetensors` and
+  `.../models/vae.safetensors` resolve. Its healthcheck HEAD-requests that exact
+  URL, so a wrong document root shows up as an *unhealthy* service instead of a
+  confusing HTTP 500 (or a poisoned browser cache) later when you upscale.
+- **`web`** — `trunk serve` on :8788, gated on `models` being healthy, so the
+  `/models/*` proxy is never hit before the file server is ready.
 
-   ```bash
-   cd crates/web
-   python3 -m http.server 8787
-   ```
-
-2. In another terminal, run trunk as usual:
-
-   ```bash
-   cd crates/web
-   trunk serve --open
-   ```
-
-   `Trunk.toml` proxies any request to `/models/*` on trunk's dev server
-   (`http://127.0.0.1:8788`) through to the file server from step 1.
+`Trunk.toml` proxies any request to `/models/*` on trunk's dev server
+(`http://127.0.0.1:8788`) through to the `models` file server. To run either
+process by hand instead, `cd crates/web` and run `python3 -m http.server 8787`
+and `trunk serve --open` in separate terminals.
 
 If you'd rather not run a second process, an alternative is to add
 `<link data-trunk rel="copy-dir" href="models" data-target-path="models">`
