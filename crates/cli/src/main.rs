@@ -174,8 +174,8 @@ struct Args {
     fast: bool,
     /// Directory holding the model's weight files. When omitted, the weights are
     /// downloaded from Hugging Face to a per-model cache dir on first run (and
-    /// reused after), except for `--model tvt`, whose weights are prepared
-    /// offline. Ignored for a part when its explicit `--unet` / `--vae` is set.
+    /// reused after). Ignored for a part when its explicit `--unet` / `--vae`
+    /// is set.
     #[arg(long)]
     models_dir: Option<PathBuf>,
     /// Explicit UNet safetensors path (overrides `--models-dir`).
@@ -223,12 +223,20 @@ impl Args {
 
     /// Shrink applied to the *input* before the ×4 pass — only under `--fast`.
     fn pre_shrink(&self) -> f32 {
-        if self.fast { self.shrink() } else { 1.0 }
+        if self.fast {
+            self.shrink()
+        } else {
+            1.0
+        }
     }
 
     /// Shrink applied to the *output* after the ×4 pass — the default path.
     fn post_shrink(&self) -> f32 {
-        if self.fast { 1.0 } else { self.shrink() }
+        if self.fast {
+            1.0
+        } else {
+            self.shrink()
+        }
     }
 
     /// The validated input path. `--input` is parsed as optional (see the field
@@ -271,19 +279,17 @@ fn model_dir_name(id: candle_upscale::ModelId) -> &'static str {
 /// With `--models-dir` set, that directory is used as-is (the dev workflow, no
 /// download). Without it, the model's [`manifest`](candle_upscale::ModelId::manifest)
 /// weights are downloaded to (and reused from) a per-model cache dir; a model
-/// with no manifest (tvt) has no auto-download path and errors with guidance.
-fn resolve_weights_root(
-    id: candle_upscale::ModelId,
-    args: &Args,
-) -> anyhow::Result<PathBuf> {
+/// with no manifest has no auto-download path and errors asking for `--models-dir`.
+fn resolve_weights_root(id: candle_upscale::ModelId, args: &Args) -> anyhow::Result<PathBuf> {
     if let Some(dir) = &args.models_dir {
         return Ok(dir.clone());
     }
     match id.manifest() {
         Some(files) => download::ensure_weights(model_dir_name(id), files, args.quiet),
         None => bail!(
-            "--model tvt needs locally-prepared weights; pass --models-dir <dir> containing \
-             fused_unet.safetensors and vae.safetensors (auto-download not yet supported for tvt)"
+            "the {} model has no published weights; pass --models-dir <dir> with its \
+             prepared weights",
+            model_dir_name(id)
         ),
     }
 }
@@ -453,8 +459,7 @@ fn run_cache_clean(model: Option<ModelChoice>) -> anyhow::Result<()> {
         return Ok(());
     }
     let freed = download::dir_size(&target);
-    std::fs::remove_dir_all(&target)
-        .with_context(|| format!("remove {}", target.display()))?;
+    std::fs::remove_dir_all(&target).with_context(|| format!("remove {}", target.display()))?;
     println!("removed {} (freed {})", target.display(), HumanBytes(freed));
     Ok(())
 }
@@ -477,7 +482,10 @@ fn run_upscale(args: Args) -> anyhow::Result<()> {
         bail!("--batch must be at least 1");
     }
     if !(0..=350).contains(&args.noise_level) {
-        bail!("--noise-level must be in 0..=350 (got {})", args.noise_level);
+        bail!(
+            "--noise-level must be in 0..=350 (got {})",
+            args.noise_level
+        );
     }
     // The model only ever upscales ×4; a net factor at or below 1 is not an
     // upscale, and above 4 the model cannot reach. (`!(_ > 1.0 && …)` also rejects
