@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use super::dino::{Dinov2, IMAGENET_MEAN, IMAGENET_STD, INPUT as DINO_INPUT};
@@ -43,6 +43,10 @@ const BLEND_VAR: f64 = 0.01;
 const VAE_LAT_TILE: usize = 64;
 /// Latent-space overlap between adjacent VAE tiles.
 const VAE_LAT_OVERLAP: usize = 8;
+/// Number of latent tiles pushed through the DiT in one batched forward. Each
+/// tile carries its CFG pair, so the forward runs at batch `2×` this. Batching
+/// amortizes per-tile kernel-launch overhead — the dominant cost of the loop.
+const DIT_TILE_BATCH: usize = 8;
 
 fn io_err(context: &str, e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{context}: {e}"))
@@ -129,25 +133,30 @@ impl Vosr {
         self.dino.forward(&x)
     }
 
-    /// One CFG DiT forward for a tile: batches the conditioned and weak inputs,
-    /// runs the DiT, and combines the two velocity predictions.
-    fn tile_velocity(
+    /// One CFG DiT forward for a batch of `n` tiles. Stacks the conditioned and
+    /// weak inputs (`2n` on the batch dim, conds then weaks), runs the DiT once,
+    /// and combines each tile's two velocity predictions with classifier-free
+    /// guidance. `conds`/`weaks` are `[1, 8, lt, lt]` and `ctxs` `[1, N, 768]`;
+    /// returns `[n, 4, lt, lt]`.
+    fn tiles_velocity(
         &self,
-        lq_tile: &Tensor,
-        lq_weak_tile: &Tensor,
-        z_tile: &Tensor,
-        feats: &Tensor,
+        conds: &[Tensor],
+        weaks: &[Tensor],
+        ctxs: &[Tensor],
         t_cur: f32,
     ) -> Result<Tensor> {
-        let inp_cond = Tensor::cat(&[lq_tile, z_tile], 1)?;
-        let inp_weak = Tensor::cat(&[lq_weak_tile, z_tile], 1)?;
-        let model_inp = Tensor::cat(&[&inp_cond, &inp_weak], 0)?;
-        let z_ctx = Tensor::cat(&[feats, &feats.zeros_like()?], 0)?;
-        let t = Tensor::from_vec(vec![t_cur, t_cur], 2, &self.device)?;
+        let n = conds.len();
+        let inputs: Vec<&Tensor> = conds.iter().chain(weaks.iter()).collect();
+        let model_inp = Tensor::cat(&inputs, 0)?;
+        // Real DINOv2 context for the conds, zeros for the weak (CFG) branch.
+        let ctx_refs: Vec<&Tensor> = ctxs.iter().collect();
+        let ctx_cond = Tensor::cat(&ctx_refs, 0)?;
+        let z_ctx = Tensor::cat(&[&ctx_cond, &ctx_cond.zeros_like()?], 0)?;
+        let t = Tensor::from_vec(vec![t_cur; 2 * n], 2 * n, &self.device)?;
 
         let d_out = self.dit.forward(&model_inp, &t, &z_ctx)?;
-        let d_cond = d_out.i(0)?.unsqueeze(0)?;
-        let d_weak = d_out.i(1)?.unsqueeze(0)?;
+        let d_cond = d_out.narrow(0, 0, n)?;
+        let d_weak = d_out.narrow(0, n, n)?;
         d_weak.broadcast_add(&(d_cond.broadcast_sub(&d_weak)?.affine(CFG_SCALE, 0.0)?))
     }
 }
@@ -303,6 +312,13 @@ impl Vosr {
         let noise = gaussian(seed, 4 * lh * lw);
         let mut z = Tensor::from_vec(noise, (1, 4, lh, lw), &self.device)?.to_dtype(self.dtype)?;
 
+        // Flatten the tile grid so tiles run through the DiT in batches (one
+        // forward per `DIT_TILE_BATCH` tiles) instead of one forward per tile.
+        let positions: Vec<(usize, usize)> = h_pos
+            .iter()
+            .flat_map(|&hi| w_pos.iter().map(move |&wi| (hi, wi)))
+            .collect();
+
         let n_steps = opts.steps.max(1);
         on_progress(0.0);
         for step in 0..n_steps {
@@ -312,18 +328,21 @@ impl Vosr {
 
             let mut u_acc = Tensor::zeros((1, 4, lh, lw), self.dtype, &self.device)?;
             let mut w_acc = u_acc.clone();
-            for &hi in &h_pos {
-                for &wi in &w_pos {
-                    let tile = |t: &Tensor| -> Result<Tensor> {
-                        t.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()
-                    };
-                    let u = self.tile_velocity(
-                        &tile(&lq_latent)?,
-                        &tile(&lq_weak)?,
-                        &tile(&z)?,
-                        &feats[&(hi, wi)],
-                        t_cur,
-                    )?;
+            for chunk in positions.chunks(DIT_TILE_BATCH) {
+                let mut conds = Vec::with_capacity(chunk.len());
+                let mut weaks = Vec::with_capacity(chunk.len());
+                let mut ctxs = Vec::with_capacity(chunk.len());
+                for &(hi, wi) in chunk {
+                    let z_t = z.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
+                    let cond_lat = lq_latent.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
+                    let weak_lat = lq_weak.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
+                    conds.push(Tensor::cat(&[&cond_lat, &z_t], 1)?);
+                    weaks.push(Tensor::cat(&[&weak_lat, &z_t], 1)?);
+                    ctxs.push(feats[&(hi, wi)].clone());
+                }
+                let u_batch = self.tiles_velocity(&conds, &weaks, &ctxs, t_cur)?;
+                for (i, &(hi, wi)) in chunk.iter().enumerate() {
+                    let u = u_batch.narrow(0, i, 1)?;
                     let contrib = (u * &g)?
                         .pad_with_zeros(2, hi, lh - hi - lt)?
                         .pad_with_zeros(3, wi, lw - wi - lt)?;
