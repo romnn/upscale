@@ -374,6 +374,17 @@ fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
     Ok((img.into_raw(), w, h))
 }
 
+fn create_output_parent(output: &Path) -> anyhow::Result<()> {
+    let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create output directory {}", parent.display()))
+}
+
 /// Write the upscaled RGBA8 buffer to `--output` (PNG or JPEG, by extension).
 ///
 /// On the default (non-`--fast`) path the model's full ×4 output is downsampled
@@ -395,6 +406,7 @@ fn write_output(args: &Args, out: Vec<u8>, ow: usize, oh: usize) -> anyhow::Resu
         img
     };
     let (ow, oh) = (img.width() as usize, img.height() as usize);
+    create_output_parent(&args.output)?;
     match image::ImageFormat::from_path(&args.output) {
         Ok(image::ImageFormat::Jpeg) => image::DynamicImage::ImageRgba8(img)
             .into_rgb8()
@@ -534,4 +546,16 @@ fn run_upscale(args: Args) -> anyhow::Result<()> {
         eprintln!("  done in {:.1}s", t.elapsed().as_secs_f32());
     }
     write_output(&args, out, ow, oh)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::create_output_parent;
+
+    #[test]
+    fn accepts_output_filename_without_parent() -> anyhow::Result<()> {
+        create_output_parent(Path::new("output.png"))
+    }
 }
