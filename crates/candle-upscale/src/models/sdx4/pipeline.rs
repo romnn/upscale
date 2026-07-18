@@ -10,48 +10,23 @@ use std::path::Path;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::noise::gaussian;
-use crate::scheduler::{DdimScheduler, LowResNoiser};
-use crate::unet::Unet;
-use crate::vae::{VaeConfig, VaeDecoder};
+use super::unet::Unet;
+use super::vae::{VaeConfig, VaeDecoder};
+use crate::common::noise::gaussian;
+use crate::common::scheduler::{DdimScheduler, LowResNoiser};
+use crate::common::tiling::{accumulate, normalize_to_rgba, rgba_to_tensor, tile_origins};
+use crate::model::{UpscaleModel, UpscaleOptions};
 
 /// VAE latent scaling factor for the x4 upscaler (`vae.config.scaling_factor`).
 const SCALING_FACTOR: f64 = 0.08333;
 const SCALE: usize = 4;
 
-/// Tunables exposed to the CLI. Defaults mirror the reference pipeline.
-#[derive(Clone, Debug)]
-pub struct UpscaleOptions {
-    /// DDIM steps (more = slower, sharper).
-    pub steps: usize,
-    /// Low-res conditioning noise level `0..=350`. Lower = more faithful.
-    pub noise_level: i64,
-    /// Low-res tile size in pixels.
-    pub tile: usize,
-    /// Tile overlap in pixels (blended to hide seams).
-    pub overlap: usize,
-    /// Tiles processed per UNet/VAE forward (stacked on the batch dim).
-    pub batch: usize,
-}
-
-impl Default for UpscaleOptions {
-    fn default() -> Self {
-        Self {
-            steps: 20,
-            noise_level: 20,
-            tile: 128,
-            overlap: 16,
-            batch: 1,
-        }
-    }
-}
-
 fn io_err(context: &str, e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{context}: {e}"))
 }
 
-/// Loaded model + device + compute dtype, ready to upscale images.
-pub struct Upscaler {
+/// Loaded SD-x4 model + device + compute dtype, ready to upscale images.
+pub struct Sdx4 {
     unet: Unet,
     vae: VaeDecoder,
     /// Precomputed empty-prompt CLIP embedding `[1, 77, 1024]`.
@@ -60,7 +35,7 @@ pub struct Upscaler {
     dtype: DType,
 }
 
-impl Upscaler {
+impl Sdx4 {
     /// Load the UNet, VAE, and empty-prompt embedding at the compute `dtype`.
     ///
     /// The weights ship as f32 on disk; `VarBuilder` converts them to `dtype` on
@@ -178,9 +153,15 @@ impl Upscaler {
         self.decode_latents(&latents)
     }
 
-    /// Upscale an RGBA8 image ×4. `on_progress` receives values in `[0, 1]`.
-    /// `seed` makes the per-tile noise reproducible.
-    pub fn upscale_rgba(
+}
+
+/// Upscale by the SD-x4 model's fixed ×4 factor with seam-blended tiling.
+impl UpscaleModel for Sdx4 {
+    fn native_scale(&self) -> usize {
+        SCALE
+    }
+
+    fn upscale_rgba(
         &self,
         rgba: &[u8],
         width: usize,
@@ -201,22 +182,7 @@ impl Upscaler {
         let mut out = vec![0f32; ow * oh * 3];
         let mut weight = vec![0f32; ow * oh];
 
-        let tile = opts.tile.clamp(8, width.max(height).max(8));
-        let overlap = opts.overlap.min(tile / 2);
-        let stride = (tile - overlap).max(1);
-        let ys: Vec<usize> = (0..height).step_by(stride).collect();
-        let xs: Vec<usize> = (0..width).step_by(stride).collect();
-        let total = (ys.len() * xs.len()).max(1);
-
-        let (th, tw) = (tile.min(height), tile.min(width));
-        let origins: Vec<(usize, usize)> = ys
-            .iter()
-            .flat_map(|&y| {
-                let y0 = (y + tile).min(height).saturating_sub(tile);
-                xs.iter()
-                    .map(move |&x| (y0, (x + tile).min(width).saturating_sub(tile)))
-            })
-            .collect();
+        let (origins, th, tw, total) = tile_origins(width, height, opts.tile, opts.overlap);
         let batch = opts.batch.max(1);
         let mut done = 0;
 
@@ -269,59 +235,4 @@ impl Upscaler {
 
         Ok((normalize_to_rgba(&out, &weight, ow, oh), ow, oh))
     }
-}
-
-/// RGBA8 `[h*w*4]` → `[1, 3, h, w]` in `[0, 1]` at the compute dtype (drops alpha).
-fn rgba_to_tensor(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
-    let hw = width * height;
-    let mut v = vec![0f32; 3 * hw];
-    for i in 0..hw {
-        for c in 0..3 {
-            v[c * hw + i] = f32::from(rgba[i * 4 + c]) / 255.0;
-        }
-    }
-    Tensor::from_vec(v, (1, 3, height, width), device)?.to_dtype(dtype)
-}
-
-/// Add a decoded output tile's CHW `vals` (`[3, th, tw]`) into the accumulation
-/// buffers at pixel offset `(ox, oy)`, one weight unit per covered pixel.
-fn accumulate(
-    out: &mut [f32],
-    weight: &mut [f32],
-    vals: &[f32],
-    th: usize,
-    tw: usize,
-    out_width: usize,
-    ox: usize,
-    oy: usize,
-) {
-    let plane = th * tw;
-    for ty in 0..th {
-        for tx in 0..tw {
-            let dst_px = (oy + ty) * out_width + (ox + tx);
-            for c in 0..3 {
-                out[dst_px * 3 + c] += vals[c * plane + ty * tw + tx];
-            }
-            weight[dst_px] += 1.0;
-        }
-    }
-}
-
-fn normalize_to_rgba(out: &[f32], weight: &[f32], width: usize, height: usize) -> Vec<u8> {
-    let mut rgba = vec![0u8; width * height * 4];
-    for px in 0..width * height {
-        let w = weight[px].max(1.0);
-        for c in 0..3 {
-            let v = (out[px * 3 + c] / w).clamp(0.0, 1.0);
-            rgba[px * 4 + c] = (v * 255.0 + 0.5) as u8;
-        }
-        rgba[px * 4 + 3] = 255;
-    }
-    rgba
 }

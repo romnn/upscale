@@ -3,17 +3,17 @@ name = "candle-upscale"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "CUDA-native candle port of the SD x4 latent-diffusion upscaler, run side-by-side with the burn reference to benchmark."
+description = "Multi-model candle image upscaler (SD x4 latent diffusion, with more models to come)."
 publish = false
 
 [lints]
 workspace = true
 
-# The `cuda` feature needs the CUDA toolkit, which CI / cross-target lint lacks.
-# Without it the crate still compiles against candle's CPU backend, so `clippy`
-# and the feature-combo matrix cover the model code with no GPU present.
+# The `cuda`/`metal` features need a GPU toolkit, which CI / cross-target lint
+# lacks. Without them the crate still compiles against candle's CPU backend, so
+# `clippy` and the feature-combo matrix cover the model code with no GPU present.
 [package.metadata.cargo-fc]
-exclude_features = ["cuda"]
+exclude_features = ["cuda", "metal"]
 
 [dependencies]
 # candle 0.10 is what `burn-candle` already locks into this workspace, so pinning
@@ -24,8 +24,12 @@ candle-core = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
 
 [features]
-default = ["cuda"]
+default = ["sdx4", "vosr", "tvt"]
+sdx4 = []
+vosr = []
+tvt = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dev-dependencies]
 # PNG I/O for the parity example (loads a real image crop, writes the output).
@@ -33,4 +37,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [[example]]
 name = "parity_candle"
-required-features = ["cuda"]
+required-features = ["cuda", "sdx4"]

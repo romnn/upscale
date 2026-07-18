@@ -1,26 +1,35 @@
-//! UNet2DConditionModel for the SD x4 upscaler (candle port).
+//! UNet2DConditionModel for the TVT upscaler (candle port).
 //!
-//! Mirrors `sd-upscale/src/unet.rs`: 7-channel `conv_in`, a noise-level
-//! class-embedding added to the timestep embedding,
-//! `only_cross_attention = [T,T,T,F]` across the down blocks,
-//! `block_out_channels [256,512,512,1024]`, 8 attention heads, v-prediction.
-//! Field names and `VarBuilder` prefixes match the diffusers state dict.
+//! A stock SD2.1 `UNet2DConditionModel` (the 5-stage variant shipped with TVT:
+//! `block_out_channels [320,320,640,1280,1280]`, `cross_attention_dim 1024`,
+//! per-stage head counts `[5,5,10,20,20]`, `transformer_layers_per_block 1`,
+//! `use_linear_projection true`, no class embedding). Unlike the SD-x4 UNet this
+//! takes a plain 4-channel latent (the VAE-D4 encoding of the low-res image) and
+//! predicts epsilon; the TVT LoRA deltas are fused into the base weights offline,
+//! so the state dict loaded here is a plain diffusers UNet.
+//!
+//! The block topology mirrors `sdx4::unet` (same diffusers `ResnetBlock2D` /
+//! `Transformer2D` / `BasicTransformerBlock` layout, same skip-connection order);
+//! it is re-implemented here rather than shared because the two UNets differ in
+//! stage count, per-stage head count, class embedding, and cross-attention
+//! pattern, which would make a shared abstraction leaky.
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::ops::silu;
 use candle_nn::{
-    conv2d, embedding, group_norm, layer_norm, linear, linear_no_bias, Conv2d, Conv2dConfig,
-    Embedding, GroupNorm, LayerNorm, Linear, VarBuilder,
+    conv2d, group_norm, layer_norm, linear, linear_no_bias, Conv2d, Conv2dConfig, GroupNorm,
+    LayerNorm, Linear, VarBuilder,
 };
 
-use crate::blocks::{conv3x3, Upsample2D};
+use crate::common::blocks::{conv3x3, Upsample2D};
 
 const NORM_EPS: f64 = 1e-5;
 const GROUPS: usize = 32;
-const HEADS: usize = 8;
 const CROSS_DIM: usize = 1024;
-const FREQ_DIM: usize = 256;
-const TIME_DIM: usize = 1024;
+/// Sinusoidal-embedding width (`block_out_channels[0]`).
+const FREQ_DIM: usize = 320;
+/// Time-embedding width (`4 * block_out_channels[0]`).
+const TIME_DIM: usize = 1280;
 
 /// Sinusoidal timestep embedding, matching diffusers `get_timestep_embedding`
 /// with `flip_sin_to_cos=true`, `downscale_freq_shift=0` (output is
@@ -58,12 +67,6 @@ impl TimestepEmbedding {
         let t = timestep_sinusoid(timestep, FREQ_DIM, device, dtype)?;
         self.linear_2.forward(&silu(&self.linear_1.forward(&t)?)?)
     }
-}
-
-/// Look up one class label (noise level) → `[1, time_dim]`.
-fn class_embed_lookup(embedding: &Embedding, class_label: i64, device: &Device) -> Result<Tensor> {
-    let idx = Tensor::from_vec(vec![class_label as u32], 1, device)?;
-    embedding.forward(&idx)
 }
 
 /// diffusers `ResnetBlock2D` with timestep conditioning (the UNet variant).
@@ -118,8 +121,19 @@ impl ResnetBlockTemb {
     }
 }
 
+/// Query-row budget per attention score block (summed across batch·heads).
+///
+/// The top-level SD2.1 self-attention here runs on a 128×128 latent (the VAE-D4
+/// is only 4×, so the latent is 128² rather than SD's usual 64²), i.e. 16384
+/// query rows. A full `[B·heads, 16384, 16384]` score matrix is several GB;
+/// splitting the query rows keeps each score block `~budget × M` regardless of
+/// resolution. The split is exact — every row's softmax runs over all keys
+/// independently.
+const ATTN_ROW_BUDGET: usize = 4096;
+
 /// Multi-head attention (self or cross), diffusers `Attention` with
-/// `to_q`/`to_k`/`to_v` (no bias) and `to_out.0` (bias). `heads = 8`.
+/// `to_q`/`to_k`/`to_v` (no bias) and `to_out.0` (bias). The head count varies
+/// per UNet stage (SD2.1 uses `head_dim = 64` throughout, so `heads = dim / 64`).
 #[derive(Debug)]
 struct Attention {
     to_q: Linear,
@@ -130,14 +144,14 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(query_dim: usize, context_dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(query_dim: usize, context_dim: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
         let inner = query_dim; // inner_dim = heads * head_dim = query_dim here
         Ok(Self {
             to_q: linear_no_bias(query_dim, inner, vb.pp("to_q"))?,
             to_k: linear_no_bias(context_dim, inner, vb.pp("to_k"))?,
             to_v: linear_no_bias(context_dim, inner, vb.pp("to_v"))?,
             to_out: linear(inner, query_dim, vb.pp("to_out").pp("0"))?,
-            heads: HEADS,
+            heads,
         })
     }
 
@@ -152,19 +166,32 @@ impl Attention {
         let v = self.to_v.forward(context)?;
 
         // [B, L, inner] -> [B*heads, L, head_dim]
+        let bh = b * self.heads;
         let split = |t: &Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.heads, head_dim))?
                 .transpose(1, 2)?
                 .contiguous()?
-                .reshape((b * self.heads, len, head_dim))
+                .reshape((bh, len, head_dim))
         };
         let q = split(&q, n)?;
         let k = split(&k, m)?;
         let v = split(&v, m)?;
 
-        let scores = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * scale)?; // [B*heads, N, M]
-        let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let out = probs.matmul(&v)?; // [B*heads, N, head_dim]
+        // Attend in query-row chunks so the score block is `[B·heads, chunk, M]`
+        // rather than the full `[B·heads, N, M]` (see ATTN_ROW_BUDGET).
+        let kt = k.transpose(1, 2)?.contiguous()?; // [B·heads, head_dim, M]
+        let chunk = (ATTN_ROW_BUDGET / bh).max(1);
+        let mut parts = Vec::with_capacity(n.div_ceil(chunk));
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            let qc = q.narrow(1, start, len)?.contiguous()?;
+            let scores = (qc.matmul(&kt)? * scale)?; // [B·heads, len, M]
+            let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
+            parts.push(probs.matmul(&v)?); // [B·heads, len, head_dim]
+            start += len;
+        }
+        let out = Tensor::cat(&parts, 1)?; // [B·heads, N, head_dim]
 
         let out = out
             .reshape((b, self.heads, n, head_dim))?
@@ -202,8 +229,9 @@ impl FeedForward {
     }
 }
 
-/// diffusers `BasicTransformerBlock`: (self-or-cross attn1) + (cross attn2) +
-/// GEGLU FF, each with a pre-LayerNorm and residual.
+/// diffusers `BasicTransformerBlock`: self-attn (attn1) + cross-attn (attn2) +
+/// GEGLU FF, each with a pre-LayerNorm and residual. TVT sets
+/// `only_cross_attention=false`, so attn1 always attends to the hidden state.
 #[derive(Debug)]
 struct BasicTransformerBlock {
     norm1: LayerNorm,
@@ -212,30 +240,23 @@ struct BasicTransformerBlock {
     attn2: Attention,
     norm3: LayerNorm,
     ff: FeedForward,
-    only_cross_attention: bool,
 }
 
 impl BasicTransformerBlock {
-    fn new(dim: usize, only_cross_attention: bool, vb: VarBuilder) -> Result<Self> {
-        let attn1_context = if only_cross_attention { CROSS_DIM } else { dim };
+    fn new(dim: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             norm1: layer_norm(dim, 1e-5, vb.pp("norm1"))?,
-            attn1: Attention::new(dim, attn1_context, vb.pp("attn1"))?,
+            attn1: Attention::new(dim, dim, heads, vb.pp("attn1"))?,
             norm2: layer_norm(dim, 1e-5, vb.pp("norm2"))?,
-            attn2: Attention::new(dim, CROSS_DIM, vb.pp("attn2"))?,
+            attn2: Attention::new(dim, CROSS_DIM, heads, vb.pp("attn2"))?,
             norm3: layer_norm(dim, 1e-5, vb.pp("norm3"))?,
             ff: FeedForward::new(dim, 4, vb.pp("ff"))?,
-            only_cross_attention,
         })
     }
 
     fn forward(&self, x: &Tensor, context: &Tensor) -> Result<Tensor> {
         let n1 = self.norm1.forward(x)?;
-        let x = if self.only_cross_attention {
-            (x + self.attn1.forward(&n1, context)?)?
-        } else {
-            (x + self.attn1.forward(&n1, &n1)?)?
-        };
+        let x = (x + self.attn1.forward(&n1, &n1)?)?;
 
         let n2 = self.norm2.forward(&x)?;
         let x = (x + self.attn2.forward(&n2, context)?)?;
@@ -256,20 +277,11 @@ struct Transformer2D {
 }
 
 impl Transformer2D {
-    fn new(
-        channels: usize,
-        num_blocks: usize,
-        only_cross_attention: bool,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(channels: usize, num_blocks: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
         let mut transformer_blocks = Vec::with_capacity(num_blocks);
         let tvb = vb.pp("transformer_blocks");
         for i in 0..num_blocks {
-            transformer_blocks.push(BasicTransformerBlock::new(
-                channels,
-                only_cross_attention,
-                tvb.pp(i),
-            )?);
+            transformer_blocks.push(BasicTransformerBlock::new(channels, heads, tvb.pp(i))?);
         }
         Ok(Self {
             // Transformer2D GroupNorm uses eps 1e-6 (not the resnet 1e-5).
@@ -429,20 +441,20 @@ fn transformers(
     vb: &VarBuilder,
     channels: usize,
     count: usize,
-    only_cross: bool,
+    heads: usize,
 ) -> Result<Vec<Transformer2D>> {
     let avb = vb.pp("attentions");
     (0..count)
-        .map(|i| Transformer2D::new(channels, 1, only_cross, avb.pp(i)))
+        .map(|i| Transformer2D::new(channels, 1, heads, avb.pp(i)))
         .collect()
 }
 
-/// `UNet2DConditionModel` for the SD x4 upscaler (7-channel input, v-prediction).
+/// `UNet2DConditionModel` for the TVT upscaler (4-channel latent input, epsilon
+/// prediction).
 #[derive(Debug)]
 pub(crate) struct Unet {
     conv_in: Conv2d,
     time_embedding: TimestepEmbedding,
-    class_embedding: Embedding,
     down_blocks: Vec<DownBlock>,
     mid_block: MidBlock,
     up_blocks: Vec<UpBlock>,
@@ -451,94 +463,101 @@ pub(crate) struct Unet {
 }
 
 impl Unet {
-    /// Build the x4-upscaler UNet with the verified channel plan, loading every
-    /// weight from `vb` (positioned at the diffusers UNet state-dict root).
+    /// Build the TVT (SD2.1, 5-stage) UNet with the verified channel plan and
+    /// per-stage head counts, loading every weight from `vb` (positioned at the
+    /// diffusers UNet state-dict root).
     pub(crate) fn new(vb: VarBuilder) -> Result<Self> {
         let dvb = vb.pp("down_blocks");
         let down_blocks = vec![
-            // DownBlock2D: no attention, downsample.
+            // CrossAttnDownBlock2D ×4 (heads 5,5,10,20), then DownBlock2D.
             DownBlock {
-                resnets: resnets(&dvb.pp(0), &[(256, 256), (256, 256)])?,
+                resnets: resnets(&dvb.pp(0), &[(320, 320), (320, 320)])?,
+                attentions: transformers(&dvb.pp(0), 320, 2, 5)?,
+                downsamplers: vec![Downsample2D::new(320, dvb.pp(0).pp("downsamplers").pp(0))?],
+            },
+            DownBlock {
+                resnets: resnets(&dvb.pp(1), &[(320, 320), (320, 320)])?,
+                attentions: transformers(&dvb.pp(1), 320, 2, 5)?,
+                downsamplers: vec![Downsample2D::new(320, dvb.pp(1).pp("downsamplers").pp(0))?],
+            },
+            DownBlock {
+                resnets: resnets(&dvb.pp(2), &[(320, 640), (640, 640)])?,
+                attentions: transformers(&dvb.pp(2), 640, 2, 10)?,
+                downsamplers: vec![Downsample2D::new(640, dvb.pp(2).pp("downsamplers").pp(0))?],
+            },
+            DownBlock {
+                resnets: resnets(&dvb.pp(3), &[(640, 1280), (1280, 1280)])?,
+                attentions: transformers(&dvb.pp(3), 1280, 2, 20)?,
+                downsamplers: vec![Downsample2D::new(1280, dvb.pp(3).pp("downsamplers").pp(0))?],
+            },
+            DownBlock {
+                resnets: resnets(&dvb.pp(4), &[(1280, 1280), (1280, 1280)])?,
                 attentions: vec![],
-                downsamplers: vec![Downsample2D::new(256, dvb.pp(0).pp("downsamplers").pp(0))?],
-            },
-            // CrossAttnDownBlock2D ×3 (only_cross_attention T,T,F).
-            DownBlock {
-                resnets: resnets(&dvb.pp(1), &[(256, 512), (512, 512)])?,
-                attentions: transformers(&dvb.pp(1), 512, 2, true)?,
-                downsamplers: vec![Downsample2D::new(512, dvb.pp(1).pp("downsamplers").pp(0))?],
-            },
-            DownBlock {
-                resnets: resnets(&dvb.pp(2), &[(512, 512), (512, 512)])?,
-                attentions: transformers(&dvb.pp(2), 512, 2, true)?,
-                downsamplers: vec![Downsample2D::new(512, dvb.pp(2).pp("downsamplers").pp(0))?],
-            },
-            DownBlock {
-                resnets: resnets(&dvb.pp(3), &[(512, 1024), (1024, 1024)])?,
-                attentions: transformers(&dvb.pp(3), 1024, 2, false)?,
                 downsamplers: vec![],
             },
         ];
 
         let mvb = vb.pp("mid_block");
         let mid_block = MidBlock {
-            resnets: resnets(&mvb, &[(1024, 1024), (1024, 1024)])?,
-            attentions: transformers(&mvb, 1024, 1, false)?,
+            resnets: resnets(&mvb, &[(1280, 1280), (1280, 1280)])?,
+            attentions: transformers(&mvb, 1280, 1, 20)?,
         };
 
-        // Up path (only_cross_attention reversed → F,T,T,-).
+        // Up path (head counts reversed → -,20,10,5,5).
         let uvb = vb.pp("up_blocks");
         let up_blocks = vec![
+            // UpBlock2D: no attention.
             UpBlock {
-                resnets: resnets(&uvb.pp(0), &[(2048, 1024), (2048, 1024), (1536, 1024)])?,
-                attentions: transformers(&uvb.pp(0), 1024, 3, false)?,
-                upsamplers: vec![Upsample2D::new(1024, uvb.pp(0).pp("upsamplers").pp(0))?],
-            },
-            UpBlock {
-                resnets: resnets(&uvb.pp(1), &[(1536, 512), (1024, 512), (1024, 512)])?,
-                attentions: transformers(&uvb.pp(1), 512, 3, true)?,
-                upsamplers: vec![Upsample2D::new(512, uvb.pp(1).pp("upsamplers").pp(0))?],
-            },
-            UpBlock {
-                resnets: resnets(&uvb.pp(2), &[(1024, 512), (1024, 512), (768, 512)])?,
-                attentions: transformers(&uvb.pp(2), 512, 3, true)?,
-                upsamplers: vec![Upsample2D::new(512, uvb.pp(2).pp("upsamplers").pp(0))?],
-            },
-            // UpBlock2D: no attention, no upsampler.
-            UpBlock {
-                resnets: resnets(&uvb.pp(3), &[(768, 256), (512, 256), (512, 256)])?,
+                resnets: resnets(&uvb.pp(0), &[(2560, 1280), (2560, 1280), (2560, 1280)])?,
                 attentions: vec![],
+                upsamplers: vec![Upsample2D::new(1280, uvb.pp(0).pp("upsamplers").pp(0))?],
+            },
+            UpBlock {
+                resnets: resnets(&uvb.pp(1), &[(2560, 1280), (2560, 1280), (1920, 1280)])?,
+                attentions: transformers(&uvb.pp(1), 1280, 3, 20)?,
+                upsamplers: vec![Upsample2D::new(1280, uvb.pp(1).pp("upsamplers").pp(0))?],
+            },
+            UpBlock {
+                resnets: resnets(&uvb.pp(2), &[(1920, 640), (1280, 640), (960, 640)])?,
+                attentions: transformers(&uvb.pp(2), 640, 3, 10)?,
+                upsamplers: vec![Upsample2D::new(640, uvb.pp(2).pp("upsamplers").pp(0))?],
+            },
+            UpBlock {
+                resnets: resnets(&uvb.pp(3), &[(960, 320), (640, 320), (640, 320)])?,
+                attentions: transformers(&uvb.pp(3), 320, 3, 5)?,
+                upsamplers: vec![Upsample2D::new(320, uvb.pp(3).pp("upsamplers").pp(0))?],
+            },
+            // Last CrossAttnUpBlock2D: no upsampler.
+            UpBlock {
+                resnets: resnets(&uvb.pp(4), &[(640, 320), (640, 320), (640, 320)])?,
+                attentions: transformers(&uvb.pp(4), 320, 3, 5)?,
                 upsamplers: vec![],
             },
         ];
 
         Ok(Self {
-            conv_in: conv3x3(7, 256, vb.pp("conv_in"))?,
+            conv_in: conv3x3(4, 320, vb.pp("conv_in"))?,
             time_embedding: TimestepEmbedding::new(FREQ_DIM, TIME_DIM, vb.pp("time_embedding"))?,
-            class_embedding: embedding(1000, TIME_DIM, vb.pp("class_embedding"))?,
             down_blocks,
             mid_block,
             up_blocks,
-            conv_norm_out: group_norm(GROUPS, 256, NORM_EPS, vb.pp("conv_norm_out"))?,
-            conv_out: conv3x3(256, 4, vb.pp("conv_out"))?,
+            conv_norm_out: group_norm(GROUPS, 320, NORM_EPS, vb.pp("conv_norm_out"))?,
+            conv_out: conv3x3(320, 4, vb.pp("conv_out"))?,
         })
     }
 
-    /// `sample`: `[N, 7, H, W]` (latent ⊕ low-res). `timestep`: diffusion step.
-    /// `context`: `[N, 77, 1024]` text embedding. `class_label`: noise level.
-    /// Returns the predicted `v` (`[N, 4, H, W]`).
+    /// `sample`: `[N, 4, H, W]` latent. `timestep`: fixed diffusion step.
+    /// `context`: `[N, 77, 1024]` prompt embedding. Returns the predicted epsilon
+    /// (`[N, 4, H, W]`).
     pub(crate) fn forward(
         &self,
         sample: &Tensor,
         timestep: f32,
         context: &Tensor,
-        class_label: i64,
         device: &Device,
         dtype: DType,
     ) -> Result<Tensor> {
-        let time_emb = self.time_embedding.forward(timestep, device, dtype)?;
-        let class_emb = class_embed_lookup(&self.class_embedding, class_label, device)?;
-        let emb = (time_emb + class_emb)?;
+        let emb = self.time_embedding.forward(timestep, device, dtype)?;
 
         let mut h = self.conv_in.forward(sample)?;
         let mut res: Vec<Tensor> = vec![h.clone()];

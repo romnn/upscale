@@ -16,14 +16,42 @@
     reason = "example/parity harness fails loudly by design"
 )]
 
-use std::path::Path;
+use std::f64::consts::PI;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candle_core::{DType, Device, Tensor};
-use candle_upscale::noise::gaussian;
-use candle_upscale::Upscaler;
+use candle_core::{DType, Tensor};
+use candle_upscale::model::LoadConfig;
 
-const EMBED: &[u8] = include_bytes!("../../sd-upscale/assets/empty_prompt_embed.safetensors");
+/// `n` standard-normal `f32` samples, deterministic in `seed`.
+///
+/// A local copy of the crate-internal host RNG: the burn parity harness must be
+/// fed byte-identical noise, so the example generates it the same way the
+/// pipeline does (splitmix64 → Box–Muller).
+fn gaussian(seed: u64, n: usize) -> Vec<f32> {
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn u01(bits: u64) -> f64 {
+        (bits >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let u1 = u01(splitmix64(&mut state)).max(f64::MIN_POSITIVE);
+        let u2 = u01(splitmix64(&mut state));
+        let radius = (-2.0 * u1.ln()).sqrt();
+        out.push((radius * (2.0 * PI * u2).cos()) as f32);
+        if out.len() < n {
+            out.push((radius * (2.0 * PI * u2).sin()) as f32);
+        }
+    }
+    out
+}
 
 fn write_f32(path: &Path, data: &[f32]) {
     let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -49,19 +77,19 @@ fn main() {
     std::fs::create_dir_all(out).expect("mkdir out");
 
     let models = format!("{home}/dev/upscale/crates/web/models");
-    let device = Device::new_cuda(0).expect("cuda");
+    let device = candle_upscale::cuda_device().expect("cuda");
     let dtype = DType::F32;
 
     eprintln!("loading models (f32)…");
     let t = Instant::now();
-    let up = Upscaler::load(
-        Path::new(&format!("{models}/unet.safetensors")),
-        Path::new(&format!("{models}/vae.safetensors")),
-        EMBED,
-        device.clone(),
+    let cfg = LoadConfig {
+        device: device.clone(),
         dtype,
-    )
-    .expect("load");
+        weights_root: PathBuf::from(&models),
+        unet: None,
+        vae: None,
+    };
+    let up = candle_upscale::models::sdx4::load(&cfg).expect("load");
     eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     // Center-crop, then (for scale 2) downsample ×2 so the native ×4 pass lands

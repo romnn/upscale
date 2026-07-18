@@ -7,7 +7,7 @@ use candle_core::{Module, Result, Tensor};
 use candle_nn::ops::silu;
 use candle_nn::{group_norm, Conv2d, GroupNorm, VarBuilder};
 
-use crate::blocks::{conv1x1, conv3x3, AttnBlock, ResnetBlock2D, Upsample2D};
+use crate::common::blocks::{conv1x1, conv3x3, AttnBlock, ResnetBlock2D, Upsample2D};
 
 const GROUPS: usize = 32;
 const EPS: f64 = 1e-6;

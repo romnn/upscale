@@ -1,52 +1,20 @@
-//! Native CLI for the SD x4 upscaler.
+//! Native, candle-only multi-model image upscaler.
 //!
-//! Drives the exact same [`sd_upscale::pipeline::Upscaler`] the browser uses, on
-//! a real GPU, so it doubles as a benchmark: wgpu by default (`--backend wgpu`),
-//! or CUDA when built with `--features cuda` (`--backend cuda`). The pipeline is
-//! generic over [`burn::tensor::backend::Backend`], so [`run`] is shared across
-//! backends and only the device construction differs.
+//! Loads a model by `--model` (or a `--preset` intent) and runs it on the
+//! fastest available device (CUDA, else Metal, else CPU), upscaling a PNG/JPEG
+//! with seam-blended tiling.
 //!
 //! ```text
 //! cargo run --release -p cli -- -i in.png -o out.png --steps 20
-//! cargo run --release -p cli --features cuda -- -i in.png --backend cuda
+//! cargo run --release -p cli --features cuda -- -i in.png --model sdx4
 //! ```
 
-use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
-use burn::tensor::backend::Backend;
-use burn::tensor::FloatDType;
+use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use sd_upscale::pipeline::{UpscaleOptions, Upscaler};
-
-/// The precomputed empty-prompt CLIP embedding `[1, 77, 1024]`. Fixed for this
-/// model release, so it's baked in rather than passed on the command line.
-const EMPTY_PROMPT_EMBED: &[u8] =
-    include_bytes!("../../sd-upscale/assets/empty_prompt_embed.safetensors");
-
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum BackendChoice {
-    /// Use CUDA when this binary was built with `--features cuda` and a device is
-    /// present, otherwise wgpu.
-    Auto,
-    /// WebGPU / wgpu (portable; the browser build's backend). Always available.
-    Wgpu,
-    /// NVIDIA CUDA. Requires a build with `--features cuda`.
-    Cuda,
-}
-
-/// Which implementation runs the diffusion model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum EngineChoice {
-    /// The reference burn implementation (backend-agnostic: wgpu or CUDA).
-    Burn,
-    /// The CUDA-native candle port. Requires a build with `--features candle`
-    /// and a CUDA device; `--backend` is ignored (candle is always CUDA).
-    Candle,
-}
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DtypeChoice {
@@ -59,7 +27,6 @@ enum DtypeChoice {
     Bf16,
 }
 
-#[cfg(feature = "candle")]
 impl DtypeChoice {
     /// Short label for logs (`f32` / `bf16`).
     fn as_str(self) -> &'static str {
@@ -70,23 +37,57 @@ impl DtypeChoice {
     }
 }
 
-/// Output upscale factor.
-///
-/// The model is a native ×4 upscaler, so a ×2 result is produced by
-/// pre-downsampling the input rather than by a different model.
+/// Which model runs the upscale. Maps to [`candle_upscale::ModelId`].
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum ScaleChoice {
-    /// Downsample the input ×2, then run the ×4 model — a ×2 result on a quarter
-    /// of the pixels (≈4× faster), at some loss of fine input detail.
-    #[value(name = "2")]
-    Two,
-    /// The model's native ×4 upscale (full detail, full cost).
-    #[value(name = "4")]
-    Four,
+enum ModelChoice {
+    /// Stable Diffusion x4 latent-diffusion upscaler.
+    Sdx4,
+    /// VOSR flow-matching latent upscaler.
+    Vosr,
+    /// TVT one-step latent upscaler.
+    Tvt,
 }
 
+impl ModelChoice {
+    /// The library model id this choice selects.
+    fn model_id(self) -> candle_upscale::ModelId {
+        match self {
+            ModelChoice::Sdx4 => candle_upscale::ModelId::Sdx4,
+            ModelChoice::Vosr => candle_upscale::ModelId::Vosr,
+            ModelChoice::Tvt => candle_upscale::ModelId::Tvt,
+        }
+    }
+}
+
+/// A user-intent preset that maps to a model. Maps to [`candle_upscale::Preset`].
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum PresetChoice {
+    /// Optimize for documents (text, line art, screenshots).
+    Document,
+    /// Optimize for photographic / natural images.
+    Image,
+}
+
+impl PresetChoice {
+    /// The library preset this choice selects.
+    fn preset(self) -> candle_upscale::Preset {
+        match self {
+            PresetChoice::Document => candle_upscale::Preset::Document,
+            PresetChoice::Image => candle_upscale::Preset::Image,
+        }
+    }
+}
+
+/// The model's fixed upscale factor. Baked into the VAE decoder's upsampling
+/// stack (`[b,4,h,w]` latent → `[b,3,4h,4w]` image), so it is not a tunable — a
+/// smaller net `--scale` is only reachable by shrinking around this pass.
+const NATIVE_SCALE: f32 = 4.0;
+
+/// Fixed seed for the per-tile noise, so a run is reproducible.
+const SEED: u64 = 0x5D5C_A1E0;
+
 #[derive(Parser)]
-#[command(about = "SD x4 latent-diffusion image upscaler (native).")]
+#[command(about = "Multi-model image upscaler (candle).")]
 struct Args {
     /// Input image (PNG or JPEG).
     #[arg(short, long)]
@@ -94,27 +95,36 @@ struct Args {
     /// Output path. PNG or JPEG, chosen by the file extension.
     #[arg(short, long, default_value = "upscaled.png")]
     output: PathBuf,
-    /// Inference engine. `burn` (default) is the reference implementation;
-    /// `candle` is the CUDA-native port (needs `--features candle`, ignores
-    /// `--backend`), built to benchmark candle against burn on CUDA.
-    #[arg(long, value_enum, default_value = "burn")]
-    engine: EngineChoice,
-    /// Compute backend. `auto` (default) prefers CUDA when available, else wgpu;
-    /// `cuda` requires a build with `--features cuda`. Ignored for
-    /// `--engine candle`.
-    #[arg(long, value_enum, default_value = "auto")]
-    backend: BackendChoice,
-    /// Compute precision. Defaults to `bf16` on CUDA (tensor cores, much faster,
-    /// tiny accuracy cost) and `f32` elsewhere (exact); `bf16` may be unsupported
-    /// on wgpu.
+    /// Model to run (mutually exclusive with `--preset`). With neither set, the
+    /// `document` preset's model is used.
+    #[arg(long, value_enum)]
+    model: Option<ModelChoice>,
+    /// Preset intent that selects a model (mutually exclusive with `--model`).
+    #[arg(long, value_enum)]
+    preset: Option<PresetChoice>,
+    /// Compute precision. Defaults to `bf16` (tensor cores, much faster, tiny
+    /// accuracy cost); `f32` is exact but slower. `bf16` may be unsupported on
+    /// some backends.
     #[arg(long, value_enum)]
     dtype: Option<DtypeChoice>,
-    /// Output upscale factor. `2` (default) downsamples the input first for a ≈4×
-    /// speedup at some detail loss; `4` is the model's native full-detail scale.
-    #[arg(long, value_enum, default_value = "2")]
-    scale: ScaleChoice,
-    /// Directory holding `unet.safetensors` / `vae.safetensors` (and `.fp16`
-    /// variants). Ignored for a part when its explicit `--unet` / `--vae` is set.
+    /// Net output upscale factor, any value in `1 < scale ≤ 4`. The model runs a
+    /// fixed ×4 pass, so a smaller factor is reached by shrinking by `4 / scale`:
+    /// by default the *output* is shrunk after a full ×4 pass (full input detail,
+    /// supersampled — so `--scale 2` costs the same as `--scale 4`); with `--fast`
+    /// the *input* is shrunk first instead (fewer pixels, faster, some detail
+    /// loss). At `--scale 4` there is no shrink either way.
+    #[arg(long, default_value_t = 2.0, value_name = "FACTOR")]
+    scale: f32,
+    /// Reach a `--scale` below 4 by pre-shrinking the *input* before the ×4 pass
+    /// — roughly `(4/scale)²`× fewer pixels through the model (e.g. ~4× faster at
+    /// `--scale 2`), trading fine detail for speed — instead of the default of
+    /// supersampling (full ×4 pass, then shrink the output). No effect at
+    /// `--scale 4`; irrelevant for tiny inputs, where pre-shrinking only loses
+    /// detail.
+    #[arg(long)]
+    fast: bool,
+    /// Directory holding `unet.safetensors` / `vae.safetensors`. Ignored for a
+    /// part when its explicit `--unet` / `--vae` is set.
     #[arg(long, default_value = "crates/web/models")]
     models_dir: PathBuf,
     /// Explicit UNet safetensors path (overrides `--models-dir`).
@@ -123,10 +133,6 @@ struct Args {
     /// Explicit VAE safetensors path (overrides `--models-dir`).
     #[arg(long)]
     vae: Option<PathBuf>,
-    /// Use the `*.fp16.safetensors` weights (up-converted to f32 on load, so the
-    /// output is identical; halves the bytes read).
-    #[arg(long)]
-    fp16: bool,
     /// DDIM denoising steps (more = slower, sharper).
     #[arg(long, default_value_t = 20)]
     steps: usize,
@@ -139,10 +145,9 @@ struct Args {
     /// Tile overlap in pixels (blended to hide seams).
     #[arg(long, default_value_t = 16)]
     overlap: usize,
-    /// Tiles per UNet/VAE forward. Higher fills the GPU for a large speedup but
-    /// needs proportionally more free VRAM. If the CUDA backend can't grow its
-    /// memory pool it prints `Memory page` panics on stderr and the output may
-    /// be corrupt — lower `--batch` (or free GPU memory) if you see them.
+    /// Tiles per model forward. Higher fills the GPU for a large speedup but needs
+    /// proportionally more free VRAM. Lower `--batch` (or free GPU memory) if a
+    /// batch runs out of memory.
     #[arg(long, default_value_t = 1)]
     batch: usize,
     /// Center-crop the input to this many pixels before upscaling (handy for a
@@ -156,23 +161,63 @@ struct Args {
 }
 
 impl Args {
-    /// Resolve the UNet and VAE safetensors paths from the explicit overrides or,
-    /// failing those, `--models-dir` plus the fp16/f32 suffix.
-    fn model_paths(&self) -> (PathBuf, PathBuf) {
-        let suffix = if self.fp16 {
-            "fp16.safetensors"
-        } else {
-            "safetensors"
-        };
-        let unet = self
-            .unet
-            .clone()
-            .unwrap_or_else(|| self.models_dir.join(format!("unet.{suffix}")));
-        let vae = self
-            .vae
-            .clone()
-            .unwrap_or_else(|| self.models_dir.join(format!("vae.{suffix}")));
-        (unet, vae)
+    /// Total linear shrink applied around the fixed ×4 pass to hit the requested
+    /// net [`scale`](Self::scale). Always ≥ 1 (the model only upscales); `1.0` at
+    /// `--scale 4`, `2.0` at `--scale 2`.
+    fn shrink(&self) -> f32 {
+        NATIVE_SCALE / self.scale
+    }
+
+    /// Shrink applied to the *input* before the ×4 pass — only under `--fast`.
+    fn pre_shrink(&self) -> f32 {
+        if self.fast { self.shrink() } else { 1.0 }
+    }
+
+    /// Shrink applied to the *output* after the ×4 pass — the default path.
+    fn post_shrink(&self) -> f32 {
+        if self.fast { 1.0 } else { self.shrink() }
+    }
+}
+
+/// Resolve which model to load from `--model` / `--preset`.
+///
+/// The two flags are mutually exclusive; with neither set, the `Document`
+/// preset's model is used.
+fn resolve_model(args: &Args) -> anyhow::Result<candle_upscale::ModelId> {
+    match (args.model, args.preset) {
+        (Some(_), Some(_)) => {
+            bail!("--model and --preset are mutually exclusive; pass at most one")
+        }
+        (Some(m), None) => Ok(m.model_id()),
+        (None, Some(p)) => Ok(p.preset().model()),
+        (None, None) => Ok(candle_upscale::Preset::Document.model()),
+    }
+}
+
+/// Resize `dim` down by `shrink` (≥ 1), rounding to the nearest pixel and never
+/// below 1. `shrink == 1.0` is returned unchanged.
+fn shrink_dim(dim: u32, shrink: f32) -> u32 {
+    if shrink <= 1.0 {
+        return dim;
+    }
+    ((dim as f32 / shrink).round() as u32).max(1)
+}
+
+/// `"WxH → …"` description of the scale transform for model-input dims `w`×`h`,
+/// naming the fixed ×4 pass and, on the supersample path, the post-shrink to the
+/// requested net scale (e.g. `64x64 → 256x256 (×4), supersampled → 128x128`).
+fn scale_desc(w: usize, h: usize, args: &Args) -> String {
+    let native = NATIVE_SCALE as usize;
+    let (mw, mh) = (w * native, h * native);
+    let shrink = args.post_shrink();
+    if shrink > 1.0 {
+        let (fw, fh) = (
+            shrink_dim(mw as u32, shrink) as usize,
+            shrink_dim(mh as u32, shrink) as usize,
+        );
+        format!("{w}x{h} → {mw}x{mh} (×{native}), supersampled → {fw}x{fh}")
+    } else {
+        format!("{w}x{h} → {mw}x{mh}")
     }
 }
 
@@ -209,9 +254,10 @@ fn progress_bar(quiet: bool) -> anyhow::Result<Option<ProgressBar>> {
     Ok(Some(pb))
 }
 
-/// Load the input image and apply the engine-agnostic preprocessing: optional
-/// center-crop, then (for `--scale 2`) an up-front ×2 downsample so the native
-/// ×4 pass lands at ×2. Returns RGBA8 bytes plus width/height.
+/// Load the input image and apply the model-agnostic preprocessing: optional
+/// center-crop, then — only under `--fast` — an up-front `4/scale`× downsample so
+/// the native ×4 pass lands at the requested net scale. Returns RGBA8 bytes plus
+/// width/height.
 fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
     let img = image::open(&args.input)
         .with_context(|| format!("open input {}", args.input.display()))?
@@ -220,16 +266,16 @@ fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
         Some(c) => center_crop(img, c),
         None => img,
     };
-    let img = match args.scale {
-        ScaleChoice::Four => img,
-        ScaleChoice::Two => {
-            let (iw, ih) = (img.width(), img.height());
-            let (dw, dh) = ((iw / 2).max(1), (ih / 2).max(1));
-            if !args.quiet {
-                eprintln!("×2 mode: downsampling input {iw}×{ih} → {dw}×{dh} before the ×4 pass");
-            }
-            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3)
+    let shrink = args.pre_shrink();
+    let img = if shrink > 1.0 {
+        let (iw, ih) = (img.width(), img.height());
+        let (dw, dh) = (shrink_dim(iw, shrink), shrink_dim(ih, shrink));
+        if !args.quiet {
+            eprintln!("--fast: pre-downsampling input {iw}×{ih} → {dw}×{dh} before the ×4 pass");
         }
+        image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
     };
     let (w, h) = (img.width() as usize, img.height() as usize);
     Ok((img.into_raw(), w, h))
@@ -237,11 +283,25 @@ fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
 
 /// Write the upscaled RGBA8 buffer to `--output` (PNG or JPEG, by extension).
 ///
-/// JPEG can't encode an alpha channel, so the alpha is dropped for JPEG output —
-/// the upscaled image is fully opaque, so nothing is lost.
+/// On the default (non-`--fast`) path the model's full ×4 output is downsampled
+/// by `4/scale` here so the saved image lands at the requested net `--scale` —
+/// supersampling, which also anti-aliases. JPEG can't encode an alpha channel, so
+/// the alpha is dropped for JPEG output — the upscaled image is fully opaque, so
+/// nothing is lost.
 fn write_output(args: &Args, out: Vec<u8>, ow: usize, oh: usize) -> anyhow::Result<()> {
     let img =
         image::RgbaImage::from_raw(ow as u32, oh as u32, out).context("assemble output image")?;
+    let shrink = args.post_shrink();
+    let img = if shrink > 1.0 {
+        let (dw, dh) = (shrink_dim(ow as u32, shrink), shrink_dim(oh as u32, shrink));
+        if !args.quiet {
+            eprintln!("supersample: downsampling output {ow}×{oh} → {dw}×{dh}");
+        }
+        image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let (ow, oh) = (img.width() as usize, img.height() as usize);
     match image::ImageFormat::from_path(&args.output) {
         Ok(image::ImageFormat::Jpeg) => image::DynamicImage::ImageRgba8(img)
             .into_rgb8()
@@ -255,338 +315,84 @@ fn write_output(args: &Args, out: Vec<u8>, ow: usize, oh: usize) -> anyhow::Resu
     Ok(())
 }
 
-/// Backend-generic pipeline run: load the models, upscale the input, write the
-/// output.
-///
-/// Shared by every backend; only `device` and `weight_dtype` differ.
-/// `weight_dtype` must match `B`'s float element (e.g. `bf16` for `Cuda<bf16>`):
-/// weights load as f32, so they are cast to the backend's element and the whole
-/// graph runs at one precision.
-fn run<B: Backend>(device: B::Device, args: &Args, weight_dtype: FloatDType) -> anyhow::Result<()> {
-    let quiet = args.quiet;
-    let (unet_path, vae_path) = args.model_paths();
-    if !quiet {
-        eprintln!(
-            "loading models ({}): {} + {}",
-            if args.fp16 { "fp16→f32" } else { "f32" },
-            unet_path.display(),
-            vae_path.display(),
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    // The scheduler indexes `alphas_cumprod` (len 1000) by step-derived timesteps
+    // and by `noise_level`. Reject inputs that would index out of bounds or skip
+    // denoising entirely and emit pure noise.
+    if !(1..1000).contains(&args.steps) {
+        bail!("--steps must be in 1..=999 (got {})", args.steps);
+    }
+    if !(0..=350).contains(&args.noise_level) {
+        bail!("--noise-level must be in 0..=350 (got {})", args.noise_level);
+    }
+    // The model only ever upscales ×4; a net factor at or below 1 is not an
+    // upscale, and above 4 the model cannot reach. (`!(_ > 1.0 && …)` also rejects
+    // a NaN `--scale`.)
+    if !(args.scale > 1.0 && args.scale <= NATIVE_SCALE) {
+        bail!(
+            "--scale must be in 1 < scale ≤ {NATIVE_SCALE} (got {})",
+            args.scale
         );
     }
+
+    let quiet = args.quiet;
+    let id = resolve_model(&args)?;
+    let dtype_choice = args.dtype.unwrap_or(DtypeChoice::Bf16);
+    let dtype = match dtype_choice {
+        DtypeChoice::F32 => candle_upscale::DType::F32,
+        DtypeChoice::Bf16 => candle_upscale::DType::BF16,
+    };
+    let device = candle_upscale::select_device()?;
+
+    let cfg = candle_upscale::LoadConfig {
+        device,
+        dtype,
+        weights_root: args.models_dir.clone(),
+        unet: args.unet.clone(),
+        vae: args.vae.clone(),
+    };
+    if !quiet {
+        eprintln!("loading {id:?} model ({})…", dtype_choice.as_str());
+    }
     let t = Instant::now();
-    let unet_bytes =
-        fs::read(&unet_path).with_context(|| format!("read UNet {}", unet_path.display()))?;
-    let vae_bytes =
-        fs::read(&vae_path).with_context(|| format!("read VAE {}", vae_path.display()))?;
-    let up = Upscaler::<B>::load_full(unet_bytes, vae_bytes, EMPTY_PROMPT_EMBED, args.fp16, device)
-        .map_err(|e| anyhow!("load models: {e}"))?
-        .cast_weights(weight_dtype);
+    let model = candle_upscale::load_model(id, &cfg).map_err(|e| anyhow!("load model: {e}"))?;
     if !quiet {
         eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
     }
 
-    let (rgba, w, h) = prepare_input(args)?;
-
-    let opts = UpscaleOptions {
+    let (rgba, w, h) = prepare_input(&args)?;
+    let opts = candle_upscale::UpscaleOptions {
         steps: args.steps,
         noise_level: args.noise_level,
         tile: args.tile,
         overlap: args.overlap,
         batch: args.batch,
     };
-    let prec = if matches!(weight_dtype, FloatDType::BF16) {
-        "bf16"
-    } else {
-        "f32"
-    };
     if !quiet {
         eprintln!(
-            "upscaling {w}x{h} → {}x{} ({} steps, noise {}, {prec})…",
-            w * 4,
-            h * 4,
+            "upscaling {} ({} steps, noise {}, {})…",
+            scale_desc(w, h, &args),
             args.steps,
             args.noise_level,
+            dtype_choice.as_str(),
         );
     }
 
     let pb = progress_bar(quiet)?;
     let t = Instant::now();
-    let (out, ow, oh) = pollster::block_on(up.upscale_rgba(&rgba, w, h, &opts, &mut |p| {
-        if let Some(pb) = &pb {
-            pb.set_position((p * PROGRESS_LEN as f32).round() as u64);
-        }
-    }))
-    .map_err(|e| anyhow!("upscale: {e}"))?;
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
-    if !quiet {
-        eprintln!("  done in {:.1}s", t.elapsed().as_secs_f32());
-    }
-
-    write_output(args, out, ow, oh)
-}
-
-fn run_wgpu(args: &Args, dtype: DtypeChoice) -> anyhow::Result<()> {
-    let device = burn::backend::wgpu::WgpuDevice::default();
-    match dtype {
-        DtypeChoice::F32 => run::<burn::backend::Wgpu>(device, args, FloatDType::F32),
-        DtypeChoice::Bf16 => {
-            run::<burn::backend::Wgpu<burn::tensor::bf16>>(device, args, FloatDType::BF16)
-        }
-    }
-}
-
-/// Highest-versioned `MAJOR.MINOR` toolkit subdirectory of `base` (for installs
-/// that keep several toolkits under one prefix, e.g. `/usr/local/cuda/13.2`).
-#[cfg(feature = "cuda")]
-fn newest_versioned_toolkit(base: &std::path::Path) -> Option<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return None;
-    };
-    let mut best: Option<((u32, u32), PathBuf)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let mut parts = name.splitn(2, '.');
-        let (Some(maj), Some(min)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let (Ok(maj), Ok(min)) = (maj.parse::<u32>(), min.parse::<u32>()) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(v, _)| (maj, min) > *v) {
-            best = Some(((maj, min), path));
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-/// Ensure `CUDA_PATH` points at a CUDA toolkit whose `include/cuda_runtime.h`
-/// exists.
-///
-/// `CUDA_PATH` is the only variable cubecl-cuda reads to give NVRTC the headers
-/// its generated kernels `#include`. When it is unset, cubecl falls back to a
-/// bare `/usr/local/cuda`; on installs where that path is a directory of
-/// versioned toolkits rather than the usual symlink, the fallback's include
-/// directory is missing and every kernel fails to compile — which surfaces not
-/// as a startup error but as a mid-run hang.
-///
-/// Deriving a valid root here (from the other conventional CUDA env vars, then a
-/// probe) turns that trap into a working run, or a clear warning if no toolkit
-/// is found.
-#[cfg(feature = "cuda")]
-fn ensure_cuda_path(quiet: bool) {
-    use std::path::Path;
-
-    fn has_headers(root: &Path) -> bool {
-        root.join("include").join("cuda_runtime.h").is_file()
-    }
-
-    if let Some(cur) = std::env::var_os("CUDA_PATH") {
-        if !cur.is_empty() && has_headers(Path::new(&cur)) {
-            return;
-        }
-    }
-
-    let mut candidates: Vec<PathBuf> = ["CUDA_HOME", "CUDA_INSTALL_PATH", "CUDA_ROOT"]
-        .into_iter()
-        .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
-        .collect();
-    for base in ["/usr/local/cuda", "/opt/cuda"] {
-        candidates.push(PathBuf::from(base));
-        candidates.extend(newest_versioned_toolkit(Path::new(base)));
-    }
-
-    if let Some(root) = candidates.into_iter().find(|c| has_headers(c)) {
-        std::env::set_var("CUDA_PATH", &root);
-        if !quiet {
-            eprintln!(
-                "note: CUDA_PATH was unset/invalid; using {} so NVRTC can find cuda_runtime.h",
-                root.display(),
-            );
-        }
-    } else if !quiet {
-        eprintln!(
-            "warning: no CUDA toolkit with include/cuda_runtime.h found; set CUDA_PATH to your \
-             toolkit root or the CUDA backend will hang on the first kernel compile"
-        );
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn run_cuda(args: &Args, dtype: DtypeChoice) -> anyhow::Result<()> {
-    ensure_cuda_path(args.quiet);
-    let device = burn::backend::cuda::CudaDevice::default();
-    match dtype {
-        DtypeChoice::F32 => run::<burn::backend::Cuda>(device, args, FloatDType::F32),
-        DtypeChoice::Bf16 => {
-            run::<burn::backend::Cuda<burn::tensor::bf16>>(device, args, FloatDType::BF16)
-        }
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-fn run_cuda(_args: &Args, _dtype: DtypeChoice) -> anyhow::Result<()> {
-    anyhow::bail!("this binary was built without CUDA support; rebuild with `--features cuda`")
-}
-
-/// Whether a usable CUDA device is present. Always `false` without the `cuda`
-/// feature, so `--backend auto` falls back to wgpu on non-CUDA builds.
-#[cfg(feature = "cuda")]
-fn cuda_available() -> bool {
-    matches!(cudarc::driver::CudaContext::device_count(), Ok(n) if n > 0)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_available() -> bool {
-    false
-}
-
-/// Fixed seed for the candle engine's per-tile noise, so a candle run is
-/// reproducible (the burn engine draws fresh noise per tile instead).
-#[cfg(feature = "candle")]
-const CANDLE_SEED: u64 = 0x5D5C_A1E0;
-
-/// The CUDA-native candle engine: mirrors [`run`], but uses candle's own device
-/// and pipeline. Candle is always CUDA, so `--backend` is ignored; `--dtype`
-/// defaults to bf16 (tensor cores) as on the burn CUDA path.
-#[cfg(feature = "candle")]
-fn run_candle(args: &Args, dtype: DtypeChoice) -> anyhow::Result<()> {
-    use candle_upscale::{DType, UpscaleOptions as CandleOptions, Upscaler as CandleUpscaler};
-
-    let quiet = args.quiet;
-    if !quiet {
-        eprintln!("engine: candle (cuda, {})", dtype.as_str());
-    }
-    let cdtype = match dtype {
-        DtypeChoice::F32 => DType::F32,
-        DtypeChoice::Bf16 => DType::BF16,
-    };
-    let device = candle_upscale::cuda_device()
-        .map_err(|e| anyhow!("open CUDA device for candle engine: {e}"))?;
-
-    let (unet_path, vae_path) = args.model_paths();
-    if !quiet {
-        eprintln!(
-            "loading models ({}): {} + {}",
-            if args.fp16 {
-                "fp16→compute"
-            } else {
-                "f32→compute"
-            },
-            unet_path.display(),
-            vae_path.display(),
-        );
-    }
-    let t = Instant::now();
-    let up = CandleUpscaler::load(&unet_path, &vae_path, EMPTY_PROMPT_EMBED, device, cdtype)
-        .map_err(|e| anyhow!("load models (candle): {e}"))?;
-    if !quiet {
-        eprintln!("  loaded in {:.1}s", t.elapsed().as_secs_f32());
-    }
-
-    let (rgba, w, h) = prepare_input(args)?;
-    let opts = CandleOptions {
-        steps: args.steps,
-        noise_level: args.noise_level,
-        tile: args.tile,
-        overlap: args.overlap,
-        batch: args.batch,
-    };
-    let prec = dtype.as_str();
-    if !quiet {
-        eprintln!(
-            "upscaling {w}x{h} → {}x{} ({} steps, noise {}, {prec}, candle)…",
-            w * 4,
-            h * 4,
-            args.steps,
-            args.noise_level,
-        );
-    }
-
-    let pb = progress_bar(quiet)?;
-    let t = Instant::now();
-    let (out, ow, oh) = up
-        .upscale_rgba(&rgba, w, h, &opts, CANDLE_SEED, &mut |p| {
+    let (out, ow, oh) = model
+        .upscale_rgba(&rgba, w, h, &opts, SEED, &mut |p| {
             if let Some(pb) = &pb {
                 pb.set_position((p * PROGRESS_LEN as f32).round() as u64);
             }
         })
-        .map_err(|e| anyhow!("upscale (candle): {e}"))?;
+        .map_err(|e| anyhow!("upscale: {e}"))?;
     if let Some(pb) = pb {
         pb.finish_and_clear();
     }
     if !quiet {
         eprintln!("  done in {:.1}s", t.elapsed().as_secs_f32());
     }
-    write_output(args, out, ow, oh)
-}
-
-#[cfg(not(feature = "candle"))]
-fn run_candle(_args: &Args, _dtype: DtypeChoice) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "this binary was built without the candle engine; rebuild with `--features candle`"
-    )
-}
-
-/// Run the reference burn engine: resolve `auto` backend, pick a precision, and
-/// dispatch to the wgpu or CUDA burn pipeline.
-fn run_burn(args: &Args) -> anyhow::Result<()> {
-    // Resolve `auto`: prefer CUDA when this build can use it and a device exists.
-    let use_cuda = match args.backend {
-        BackendChoice::Cuda => true,
-        BackendChoice::Wgpu => false,
-        BackendChoice::Auto => cuda_available(),
-    };
-    // Precision defaults per backend: bf16 on CUDA (tensor cores), f32 on wgpu.
-    let dtype = args.dtype.unwrap_or(if use_cuda {
-        DtypeChoice::Bf16
-    } else {
-        DtypeChoice::F32
-    });
-    // WebGPU has no bf16 type, so cubecl-wgpu's WGSL compiler panics on it.
-    // Reject the combination up front instead of crashing mid-run.
-    if !use_cuda && matches!(dtype, DtypeChoice::Bf16) {
-        anyhow::bail!(
-            "bf16 is unsupported on the wgpu backend (WebGPU has no bf16 type); \
-             use --dtype f32, or --backend cuda"
-        );
-    }
-    if !args.quiet {
-        eprintln!("backend: {}", if use_cuda { "cuda" } else { "wgpu" });
-    }
-    if use_cuda {
-        run_cuda(args, dtype)
-    } else {
-        run_wgpu(args, dtype)
-    }
-}
-
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    // Both engines' schedulers index `alphas_cumprod` (len 1000) by step-derived
-    // timesteps and by `noise_level`. Reject inputs that would index out of bounds
-    // (a panic) or, on candle, skip denoising entirely and emit pure noise.
-    if !(1..1000).contains(&args.steps) {
-        anyhow::bail!("--steps must be in 1..=999 (got {})", args.steps);
-    }
-    if !(0..=350).contains(&args.noise_level) {
-        anyhow::bail!(
-            "--noise-level must be in 0..=350 (got {})",
-            args.noise_level
-        );
-    }
-    match args.engine {
-        EngineChoice::Burn => run_burn(&args),
-        EngineChoice::Candle => {
-            // Candle is CUDA-native; precision defaults to bf16 like the burn CUDA
-            // path, and `--backend` does not apply. The `engine:` line is announced
-            // inside `run_candle` so a non-candle build's bailing stub doesn't
-            // falsely print it.
-            run_candle(&args, args.dtype.unwrap_or(DtypeChoice::Bf16))
-        }
-    }
+    write_output(&args, out, ow, oh)
 }
