@@ -190,7 +190,9 @@ struct Args {
     /// Low-res conditioning noise level (`0..=350`; lower = more faithful).
     #[arg(long, default_value_t = 20)]
     noise_level: i64,
-    /// Tile size in pixels (the model is trained around 128).
+    /// Tile size in pixels (the model is trained around 128). Lower values use
+    /// less VRAM but produce more tiles; TVT's upstream low-memory profile uses
+    /// `--tile 96 --overlap 32`.
     #[arg(long, default_value_t = 128)]
     tile: usize,
     /// Tile overlap in pixels (blended to hide seams).

@@ -2,12 +2,12 @@
 //! `tile_forward`).
 //!
 //! Bicubically upscale the low-res image ×4 to the target resolution, encode it
-//! once with the VAE-D4 to a 4-channel latent, run a single UNet forward
-//! (conditioned on a fixed prompt embedding) tiled in latent space when large,
-//! apply the one-step epsilon → x₀ solve, and decode the refined latent back to
-//! the ×4 image. There is no multi-step loop and no classifier-free guidance
-//! (`--cfg 0`): the model does its super-resolution in one shot, leaning on the
-//! detail-preserving 4× VAE plus a light latent refinement.
+//! with the VAE-D4 in overlapping tiles, run a single UNet forward (conditioned
+//! on a fixed prompt embedding) over the same latent tiles, apply the one-step
+//! epsilon → x₀ solve, and decode the refined latent in tiles. There is no
+//! multi-step loop and no classifier-free guidance (`--cfg 0`): the model does
+//! its super-resolution in one shot, leaning on the detail-preserving 4× VAE
+//! plus a light latent refinement.
 
 use std::path::Path;
 
@@ -24,6 +24,8 @@ use crate::model::{UpscaleModel, UpscaleOptions};
 const SCALING_FACTOR: f64 = 0.18215;
 /// Fixed integer upscale factor.
 const SCALE: usize = 4;
+/// Latent-to-pixel ratio of VAE-D4.
+const AE_FACTOR: usize = 4;
 /// Fixed UNet conditioning timestep (`--time_step 1` in the reference script).
 const TIME_STEP: i64 = 1;
 /// SD2.1 DDPM schedule bounds (`scaled_linear`).
@@ -142,19 +144,26 @@ impl Tvt {
         lw: usize,
         opts: &UpscaleOptions,
     ) -> Result<Tensor> {
-        let tile = opts.tile.clamp(8, lh.max(lw)).min(lh).min(lw);
-        if lh <= tile && lw <= tile {
+        let (origins, th, tw, _) = tile_origins(lw, lh, opts.tile, opts.overlap);
+        if lh <= th && lw <= tw {
             return self.unet_forward(lq_latent);
         }
 
-        let (origins, th, tw, _) = tile_origins(lw, lh, tile, opts.overlap);
-        let g = gaussian_weights(th, tw, &self.device, self.dtype)?;
+        let g = gaussian_mask(th, tw, 4, &self.device, self.dtype)?;
         let mut acc = Tensor::zeros((1, 4, lh, lw), self.dtype, &self.device)?;
         let mut wsum = acc.clone();
         for &(y0, x0) in &origins {
-            let tile_in = lq_latent.narrow(2, y0, th)?.narrow(3, x0, tw)?.contiguous()?;
+            let tile_in = lq_latent
+                .narrow(2, y0, th)?
+                .narrow(3, x0, tw)?
+                .contiguous()?;
             let pred = (self.unet_forward(&tile_in)? * &g)?;
-            acc = (acc + pred.pad_with_zeros(2, y0, lh - y0 - th)?.pad_with_zeros(3, x0, lw - x0 - tw)?)?;
+            acc = (acc
+                + pred.pad_with_zeros(2, y0, lh - y0 - th)?.pad_with_zeros(
+                    3,
+                    x0,
+                    lw - x0 - tw,
+                )?)?;
             wsum = (wsum
                 + g.pad_with_zeros(2, y0, lh - y0 - th)?
                     .pad_with_zeros(3, x0, lw - x0 - tw)?)?;
@@ -173,26 +182,106 @@ impl Tvt {
         )
     }
 
+    /// VAE-encode the HR conditioning image in latent-aligned tiles so its
+    /// activations stay bounded, returning the stitched, unscaled mean latent
+    /// `[1, 4, hh/4, ww/4]`. The user-facing low-res tile size maps directly to
+    /// VAE-D4 latent pixels because both upscale and compression factors are ×4.
+    fn encode_tiled(
+        &self,
+        conditioning: &Tensor,
+        hh: usize,
+        ww: usize,
+        opts: &UpscaleOptions,
+    ) -> Result<Tensor> {
+        let (lh, lw) = (hh / AE_FACTOR, ww / AE_FACTOR);
+        let (origins, th, tw, _) = tile_origins(lw, lh, opts.tile, opts.overlap);
+        if lh <= th && lw <= tw {
+            return self.encoder.encode_mean(conditioning);
+        }
+
+        let g = gaussian_mask(th, tw, 4, &self.device, self.dtype)?;
+        let mut acc = Tensor::zeros((1, 4, lh, lw), self.dtype, &self.device)?;
+        let mut wsum = acc.clone();
+        for &(ly, lx) in &origins {
+            let tile = conditioning
+                .narrow(2, ly * AE_FACTOR, th * AE_FACTOR)?
+                .narrow(3, lx * AE_FACTOR, tw * AE_FACTOR)?
+                .contiguous()?;
+            let latent = (self.encoder.encode_mean(&tile)? * &g)?;
+            let (bottom, right) = (lh - ly - th, lw - lx - tw);
+            acc = (acc
+                + latent
+                    .pad_with_zeros(2, ly, bottom)?
+                    .pad_with_zeros(3, lx, right)?)?;
+            wsum = (wsum
+                + g.pad_with_zeros(2, ly, bottom)?
+                    .pad_with_zeros(3, lx, right)?)?;
+        }
+        acc.div(&wsum)
+    }
+
+    /// VAE-decode the latent in overlapping tiles so its activations stay
+    /// bounded, returning the stitched image `[1, 3, lh*4, lw*4]` in
+    /// approximately `[-1, 1]`.
+    fn decode_tiled(
+        &self,
+        latent: &Tensor,
+        lh: usize,
+        lw: usize,
+        opts: &UpscaleOptions,
+    ) -> Result<Tensor> {
+        let (origins, th, tw, _) = tile_origins(lw, lh, opts.tile, opts.overlap);
+        if lh <= th && lw <= tw {
+            return self.decoder.forward(latent);
+        }
+
+        let (hh, ww) = (lh * AE_FACTOR, lw * AE_FACTOR);
+        let (ph, pw) = (th * AE_FACTOR, tw * AE_FACTOR);
+        let g = gaussian_mask(ph, pw, 3, &self.device, self.dtype)?;
+        let mut acc = Tensor::zeros((1, 3, hh, ww), self.dtype, &self.device)?;
+        let mut wsum = acc.clone();
+        for &(ly, lx) in &origins {
+            let tile = latent.narrow(2, ly, th)?.narrow(3, lx, tw)?.contiguous()?;
+            let decoded = (self.decoder.forward(&tile)? * &g)?;
+            let (py, px) = (ly * AE_FACTOR, lx * AE_FACTOR);
+            let (bottom, right) = (hh - py - ph, ww - px - pw);
+            acc = (acc
+                + decoded
+                    .pad_with_zeros(2, py, bottom)?
+                    .pad_with_zeros(3, px, right)?)?;
+            wsum = (wsum
+                + g.pad_with_zeros(2, py, bottom)?
+                    .pad_with_zeros(3, px, right)?)?;
+        }
+        acc.div(&wsum)
+    }
+
     /// Run the full pipeline on an HR conditioning image (planar `[3, hh, ww]` in
     /// `[0, 1]`), returning the decoded image tensor `[1, 3, hh, ww]` in `[0, 1]`.
     fn run(&self, hr: &[f32], hh: usize, ww: usize, opts: &UpscaleOptions) -> Result<Tensor> {
         // Reference: c_t = to_tensor(image)*2-1, then vae.encode * scaling_factor.
         let c_t: Vec<f32> = hr.iter().map(|v| v * 2.0 - 1.0).collect();
         let c_t = Tensor::from_vec(c_t, (1, 3, hh, ww), &self.device)?.to_dtype(self.dtype)?;
-        let lq_latent = (self.encoder.encode_mean(&c_t)? * SCALING_FACTOR)?;
+        let lq_latent = (self.encode_tiled(&c_t, hh, ww, opts)? * SCALING_FACTOR)?;
+        let (_, _, lh, lw) = lq_latent.dims4()?;
 
         let x0 = self.refine_latent(&lq_latent, opts)?;
 
         let decoded = self
-            .decoder
-            .forward(&(x0 * (1.0 / SCALING_FACTOR))?)?
+            .decode_tiled(&(x0 * (1.0 / SCALING_FACTOR))?, lh, lw, opts)?
             .clamp(-1f32, 1f32)?;
         decoded.affine(0.5, 0.5)
     }
 }
 
-/// Gaussian blend mask `[1, 4, th, tw]` peaked at the centre (`_gaussian_weights`).
-fn gaussian_weights(th: usize, tw: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+/// Gaussian blend mask `[1, channels, th, tw]` peaked at the centre.
+fn gaussian_mask(
+    th: usize,
+    tw: usize,
+    channels: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     let axis = |len: usize| -> Vec<f64> {
         let mid = (len as f64 - 1.0) / 2.0;
         (0..len)
@@ -207,7 +296,7 @@ fn gaussian_weights(th: usize, tw: usize, device: &Device, dtype: DType) -> Resu
         }
     }
     Tensor::from_vec(w, (1, 1, th, tw), device)?
-        .broadcast_as((1, 4, th, tw))?
+        .broadcast_as((1, channels, th, tw))?
         .to_dtype(dtype)?
         .contiguous()
 }
