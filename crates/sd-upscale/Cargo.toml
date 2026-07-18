@@ -8,9 +8,12 @@ description = "Stable Diffusion x4 latent-diffusion upscaler, ported to burn (ba
 [lints]
 workspace = true
 
-# `cuda` needs the CUDA toolkit, which CI (and cross-target lint) doesn't have.
+# CUDA is varied only for Linux; the default feature is an empty umbrella.
 [package.metadata.cargo-fc]
-exclude_features = ["cuda"]
+exclude_features = ["default"]
+
+[package.metadata.cargo-fc.target.'cfg(not(target_os = "linux"))']
+exclude_features = { add = ["cuda"] }
 
 [dependencies]
 # Backend-agnostic model. A concrete backend is chosen by the binary/test via a

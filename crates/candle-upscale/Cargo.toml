@@ -9,11 +9,16 @@ publish = false
 [lints]
 workspace = true
 
-# The `cuda`/`metal` features need a GPU toolkit, which CI / cross-target lint
-# lacks. Without them the crate still compiles against candle's CPU backend, so
-# `clippy` and the feature-combo matrix cover the model code with no GPU present.
+# Vary every model feature on every target. CUDA is Linux-only in this matrix;
+# Metal is macOS-only. The default umbrella is redundant with explicit models.
 [package.metadata.cargo-fc]
-exclude_features = ["cuda", "metal"]
+exclude_features = ["default"]
+
+[package.metadata.cargo-fc.target.'cfg(not(target_os = "linux"))']
+exclude_features = { add = ["cuda"] }
+
+[package.metadata.cargo-fc.target.'cfg(not(target_os = "macos"))']
+exclude_features = { add = ["metal"] }
 
 [dependencies]
 # candle 0.10 is what `burn-candle` already locks into this workspace, so pinning
@@ -22,13 +27,14 @@ exclude_features = ["cuda", "metal"]
 # without it candle falls back to CPU so the crate builds toolkit-free.
 candle-core = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
+candle-flash-attn = { version = "0.10", optional = true }
 
 [features]
 default = ["sdx4", "vosr", "tvt"]
 sdx4 = []
 vosr = []
 tvt = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:candle-flash-attn"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dev-dependencies]

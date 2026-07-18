@@ -16,6 +16,13 @@ burn-store = { version = "0.21", default-features = false }
 
 [workspace.metadata.cargo-fc]
 install_missing_targets = true
+dedup = true
+aggregate_targets = true
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-gnu",
+  "aarch64-apple-darwin",
+]
 
 [workspace.lints.rust]
 warnings = { level = "warn", priority = -1 }

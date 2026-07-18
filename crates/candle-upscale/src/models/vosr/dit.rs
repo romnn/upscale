@@ -8,8 +8,13 @@
 //! adaLN-single modulation derived from the timestep.
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::ops::{silu, softmax};
-use candle_nn::{conv2d, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
+use candle_nn::ops::silu;
+use candle_nn::{
+    conv2d, layer_norm, linear, rms_norm, Conv2d, Conv2dConfig, LayerNorm, Linear, RmsNorm,
+    VarBuilder,
+};
+
+use super::attention::AttentionBackend;
 
 const DIM: usize = 1024;
 const DEPTH: usize = 28;
@@ -27,31 +32,6 @@ const RMS_EPS: f64 = 1e-6;
 /// 512/8 / 2`). At inference the tile grid can differ, so RoPE is rebuilt per
 /// grid size but the frequency spacing stays anchored to this length.
 const TRAIN_GRID: f64 = 32.0;
-
-/// RMS normalization over the last dim with a learned per-channel weight,
-/// computed in f32 for stability then cast back (matching the reference).
-#[derive(Debug)]
-struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl RmsNorm {
-    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            weight: vb.get(dim, "weight")?,
-            eps: RMS_EPS,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x32 = x.to_dtype(DType::F32)?;
-        let ms = x32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x32.broadcast_div(&(ms + self.eps)?.sqrt()?)?;
-        normed.to_dtype(dtype)?.broadcast_mul(&self.weight)
-    }
-}
 
 /// `x * (1 + scale) + shift` with `scale`/`shift` broadcast over the token axis
 /// (adaLN-single modulation; the tensors arrive already shaped `[B, 1, C]`).
@@ -117,15 +97,6 @@ fn rope_tables(g: usize, device: &Device, dtype: DType) -> Result<(Tensor, Tenso
     Ok((cos, sin))
 }
 
-/// Scaled-dot-product attention with an explicit `1/sqrt(head_dim)` scale.
-/// `q,k,v` are `[B, heads, Nq/Nk, head_dim]`; returns `[B, heads, Nq, head_dim]`.
-fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-    let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-    let scores = (q.contiguous()?.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)? * scale)?;
-    let probs = softmax(&scores, D::Minus1)?;
-    probs.matmul(&v.contiguous()?)
-}
-
 /// Fused-QKV self-attention with QK-RMSNorm and 2D RoPE.
 #[derive(Debug)]
 struct SelfAttn {
@@ -140,12 +111,18 @@ impl SelfAttn {
         Ok(Self {
             qkv: linear(DIM, 3 * DIM, vb.pp("qkv"))?,
             proj: linear(DIM, DIM, vb.pp("proj"))?,
-            q_norm: RmsNorm::new(HEAD_DIM, vb.pp("q_norm"))?,
-            k_norm: RmsNorm::new(HEAD_DIM, vb.pp("k_norm"))?,
+            q_norm: rms_norm(HEAD_DIM, RMS_EPS, vb.pp("q_norm"))?,
+            k_norm: rms_norm(HEAD_DIM, RMS_EPS, vb.pp("k_norm"))?,
         })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention: AttentionBackend,
+    ) -> Result<Tensor> {
         let (b, n, c) = x.dims3()?;
         let qkv = self
             .qkv
@@ -157,7 +134,8 @@ impl SelfAttn {
         let v = qkv.i(2)?.contiguous()?;
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
-        let out = sdpa(&q, &k, &v)?
+        let out = attention
+            .forward(&q, &k, &v)?
             .transpose(1, 2)?
             .reshape((b, n, c))?;
         self.proj.forward(&out)
@@ -182,8 +160,8 @@ impl CrossAttn {
             k_linear: linear(DIM, DIM, vb.pp("k_linear"))?,
             v_linear: linear(DIM, DIM, vb.pp("v_linear"))?,
             proj: linear(DIM, DIM, vb.pp("proj"))?,
-            q_norm: RmsNorm::new(HEAD_DIM, vb.pp("q_norm"))?,
-            k_norm: RmsNorm::new(HEAD_DIM, vb.pp("k_norm"))?,
+            q_norm: rms_norm(HEAD_DIM, RMS_EPS, vb.pp("q_norm"))?,
+            k_norm: rms_norm(HEAD_DIM, RMS_EPS, vb.pp("k_norm"))?,
         })
     }
 
@@ -192,12 +170,17 @@ impl CrossAttn {
         x.reshape((b, n, HEADS, HEAD_DIM))?.transpose(1, 2)
     }
 
-    fn forward(&self, x: &Tensor, ctx: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, ctx: &Tensor, attention: AttentionBackend) -> Result<Tensor> {
         let (b, n, c) = x.dims3()?;
-        let q = self.q_norm.forward(&Self::heads(&self.q_linear.forward(x)?)?)?;
-        let k = self.k_norm.forward(&Self::heads(&self.k_linear.forward(ctx)?)?)?;
-        let v = Self::heads(&self.v_linear.forward(ctx)?)?;
-        let out = sdpa(&q, &k, &v)?.transpose(1, 2)?.reshape((b, n, c))?;
+        let q = Self::heads(&self.q_linear.forward(x)?)?.contiguous()?;
+        let k = Self::heads(&self.k_linear.forward(ctx)?)?.contiguous()?;
+        let v = Self::heads(&self.v_linear.forward(ctx)?)?.contiguous()?;
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+        let out = attention
+            .forward(&q, &k, &v)?
+            .transpose(1, 2)?
+            .reshape((b, n, c))?;
         self.proj.forward(&out)
     }
 }
@@ -240,10 +223,10 @@ struct Block {
 impl Block {
     fn new(vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            norm1: RmsNorm::new(DIM, vb.pp("norm1"))?,
+            norm1: rms_norm(DIM, RMS_EPS, vb.pp("norm1"))?,
             attn: SelfAttn::new(vb.pp("attn"))?,
             cross_attn: CrossAttn::new(vb.pp("cross_attn"))?,
-            norm2: RmsNorm::new(DIM, vb.pp("norm2"))?,
+            norm2: rms_norm(DIM, RMS_EPS, vb.pp("norm2"))?,
             mlp: SwiGlu::new(vb.pp("mlp"))?,
             scale_shift_table: vb.get((6, DIM), "scale_shift_table")?,
         })
@@ -256,6 +239,7 @@ impl Block {
         ctx: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        attention: AttentionBackend,
     ) -> Result<Tensor> {
         let b = x.dim(0)?;
         let mods = self
@@ -267,8 +251,11 @@ impl Block {
         let (shift_mlp, scale_mlp, gate_mlp) = (part(3)?, part(4)?, part(5)?);
 
         let h = modulate(&self.norm1.forward(x)?, &scale_msa, &shift_msa)?;
-        let x = (x + self.attn.forward(&h, cos, sin)?.broadcast_mul(&gate_msa)?)?;
-        let x = (&x + self.cross_attn.forward(&x, ctx)?)?;
+        let x = (x + self
+            .attn
+            .forward(&h, cos, sin, attention)?
+            .broadcast_mul(&gate_msa)?)?;
+        let x = (&x + self.cross_attn.forward(&x, ctx, attention)?)?;
         let h = modulate(&self.norm2.forward(&x)?, &scale_mlp, &shift_mlp)?;
         &x + self.mlp.forward(&h)?.broadcast_mul(&gate_mlp)?
     }
@@ -319,7 +306,7 @@ struct FinalLayer {
 impl FinalLayer {
     fn new(vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            norm_final: RmsNorm::new(DIM, vb.pp("norm_final"))?,
+            norm_final: rms_norm(DIM, RMS_EPS, vb.pp("norm_final"))?,
             linear: linear(DIM, PATCH * PATCH * OUT_CH, vb.pp("linear"))?,
             ada: linear(DIM, 2 * DIM, vb.pp("adaLN_modulation").pp(1))?,
         })
@@ -348,11 +335,13 @@ pub(crate) struct Dit {
     ctx_fc2: Linear,
     device: Device,
     dtype: DType,
+    attention: AttentionBackend,
 }
 
 impl Dit {
     /// Build the DiT from a VarBuilder positioned at the checkpoint root.
     pub(crate) fn new(vb: VarBuilder, device: Device, dtype: DType) -> Result<Self> {
+        let attention = AttentionBackend::select(&device, dtype)?;
         let x_proj = conv2d(
             IN_CH,
             DIM,
@@ -378,31 +367,38 @@ impl Dit {
             ctx_fc2: linear(MLP_CA_HIDDEN, DIM, vb.pp("mlp_ca").pp("fc2"))?,
             device,
             dtype,
+            attention,
         })
     }
 
-    /// Project raw DINOv2 layer-8 features `[B, N, 768]` into the cross-attention
+    pub(crate) fn attention_name(&self) -> &'static str {
+        self.attention.name()
+    }
+
+    /// Projects raw DINOv2 layer-8 features `[B, N, 768]` into cross-attention
     /// context `[B, N, 1024]` (LayerNorm → fc1 → tanh-GELU → fc2).
-    fn context(&self, feats: &Tensor) -> Result<Tensor> {
+    pub(crate) fn project_context(&self, feats: &Tensor) -> Result<Tensor> {
         let z = self.ctx_norm.forward(feats)?;
         let z = self.ctx_fc1.forward(&z)?.gelu()?;
         self.ctx_fc2.forward(&z)
     }
 
     /// Predict the velocity latent for `x` `[B, 8, H, W]` at flow time `t` `[B]`
-    /// conditioned on DINOv2 features `ctx_feats` `[B, N, 768]`.
-    pub(crate) fn forward(&self, x: &Tensor, t: &Tensor, ctx_feats: &Tensor) -> Result<Tensor> {
+    /// conditioned on projected DINOv2 context `ctx` `[B, N, 1024]`.
+    pub(crate) fn forward(&self, x: &Tensor, t: &Tensor, ctx: &Tensor) -> Result<Tensor> {
         let tokens = self.x_proj.forward(x)?;
         let (b, dim, gh, gw) = tokens.dims4()?;
-        let mut h = tokens.reshape((b, dim, gh * gw))?.transpose(1, 2)?.contiguous()?;
+        let mut h = tokens
+            .reshape((b, dim, gh * gw))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let c = self.t_embedder.forward(t)?;
         let c0 = self.t_block.forward(&silu(&c)?)?;
-        let ctx = self.context(ctx_feats)?;
         let (cos, sin) = rope_tables(gh, &self.device, self.dtype)?;
 
         for block in &self.blocks {
-            h = block.forward(&h, &c0, &ctx, &cos, &sin)?;
+            h = block.forward(&h, &c0, ctx, &cos, &sin, self.attention)?;
         }
         let h = self.final_layer.forward(&h, &c)?;
         unpatchify(&h, gh)

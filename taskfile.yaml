@@ -16,9 +16,10 @@ tasks:
       - cargo check --all-targets {{.CLI_ARGS}}
 
   check:fc:
-    desc: "check every feature combination (sd-upscale native, web on wasm)"
+    desc: "check every feature and target combination"
     cmds:
-      - cargo fc check --workspace {{.CLI_ARGS}}
+      - cargo fc --aggregate-targets --workspace --exclude cli check {{.CLI_ARGS}}
+      - cargo fc -p cli check {{.CLI_ARGS}}
 
   test:
     desc: "test the native crates"
@@ -64,9 +65,10 @@ tasks:
       - task: lint:ast-grep
 
   lint:fc:
-    desc: "lint every feature combination (sd-upscale native, web on wasm)"
+    desc: "lint every feature and target combination"
     cmds:
-      - cargo fc lint --dedup --workspace {{.CLI_ARGS}}
+      - cargo fc --aggregate-targets --dedup --workspace --exclude cli lint {{.CLI_ARGS}}
+      - cargo fc --dedup -p cli lint {{.CLI_ARGS}}
       - task: lint:ast-grep
 
   lint:fix:

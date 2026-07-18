@@ -16,6 +16,7 @@ use candle_nn::VarBuilder;
 
 use super::dino::{Dinov2, IMAGENET_MEAN, IMAGENET_STD, INPUT as DINO_INPUT};
 use super::dit::Dit;
+use super::profile::PhaseTimer;
 use super::vae::{Encoder, LightDecoder};
 use crate::common::noise::gaussian;
 use crate::common::resize::bicubic_chw;
@@ -43,11 +44,6 @@ const BLEND_VAR: f64 = 0.01;
 const VAE_LAT_TILE: usize = 64;
 /// Latent-space overlap between adjacent VAE tiles.
 const VAE_LAT_OVERLAP: usize = 8;
-/// Number of latent tiles pushed through the DiT in one batched forward. Each
-/// tile carries its CFG pair, so the forward runs at batch `2×` this. Batching
-/// amortizes per-tile kernel-launch overhead — the dominant cost of the loop.
-const DIT_TILE_BATCH: usize = 8;
-
 fn io_err(context: &str, e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{context}: {e}"))
 }
@@ -136,25 +132,28 @@ impl Vosr {
     /// One CFG DiT forward for a batch of `n` tiles. Stacks the conditioned and
     /// weak inputs (`2n` on the batch dim, conds then weaks), runs the DiT once,
     /// and combines each tile's two velocity predictions with classifier-free
-    /// guidance. `conds`/`weaks` are `[1, 8, lt, lt]` and `ctxs` `[1, N, 768]`;
-    /// returns `[n, 4, lt, lt]`.
+    /// guidance. `conds`/`weaks` are `[1, 8, lt, lt]`, `ctxs` and `weak_ctx`
+    /// are projected `[1, N, 1024]` contexts; returns `[n, 4, lt, lt]`.
     fn tiles_velocity(
         &self,
         conds: &[Tensor],
         weaks: &[Tensor],
         ctxs: &[Tensor],
+        weak_ctx: &Tensor,
         t_cur: f32,
     ) -> Result<Tensor> {
         let n = conds.len();
         let inputs: Vec<&Tensor> = conds.iter().chain(weaks.iter()).collect();
         let model_inp = Tensor::cat(&inputs, 0)?;
-        // Real DINOv2 context for the conds, zeros for the weak (CFG) branch.
+        // Real DINOv2 context for the conds, projected zero context for the weak
+        // (CFG) branch.
         let ctx_refs: Vec<&Tensor> = ctxs.iter().collect();
         let ctx_cond = Tensor::cat(&ctx_refs, 0)?;
-        let z_ctx = Tensor::cat(&[&ctx_cond, &ctx_cond.zeros_like()?], 0)?;
+        let ctx_weak = weak_ctx.broadcast_as(ctx_cond.shape())?;
+        let ctx = Tensor::cat(&[&ctx_cond, &ctx_weak], 0)?;
         let t = Tensor::from_vec(vec![t_cur; 2 * n], 2 * n, &self.device)?;
 
-        let d_out = self.dit.forward(&model_inp, &t, &z_ctx)?;
+        let d_out = self.dit.forward(&model_inp, &t, &ctx)?;
         let d_cond = d_out.narrow(0, 0, n)?;
         let d_weak = d_out.narrow(0, n, n)?;
         d_weak.broadcast_add(&(d_cond.broadcast_sub(&d_weak)?.affine(CFG_SCALE, 0.0)?))
@@ -197,7 +196,16 @@ fn gaussian_mask(tile: usize, channels: usize, device: &Device, dtype: DType) ->
 }
 
 /// Crop a planar `[c, h, w]` buffer to `[c, y1-y0, x1-x0]`.
-fn crop_chw(src: &[f32], c: usize, h: usize, w: usize, y0: usize, y1: usize, x0: usize, x1: usize) -> Vec<f32> {
+fn crop_chw(
+    src: &[f32],
+    c: usize,
+    h: usize,
+    w: usize,
+    y0: usize,
+    y1: usize,
+    x0: usize,
+    x1: usize,
+) -> Vec<f32> {
     let (ch, cw) = (y1 - y0, x1 - x0);
     let mut out = vec![0f32; c * ch * cw];
     for ci in 0..c {
@@ -230,7 +238,10 @@ impl Vosr {
                     .contiguous()?;
                 let lat = self.encoder.encode_mean(&ptile)?;
                 let (pr, pd) = (lh - ly - lt, lw - lx - lt);
-                acc = (acc + (lat * &g)?.pad_with_zeros(2, ly, pr)?.pad_with_zeros(3, lx, pd)?)?;
+                acc = (acc
+                    + (lat * &g)?
+                        .pad_with_zeros(2, ly, pr)?
+                        .pad_with_zeros(3, lx, pd)?)?;
                 wacc = (wacc + g.pad_with_zeros(2, ly, pr)?.pad_with_zeros(3, lx, pd)?)?;
             }
         }
@@ -254,7 +265,10 @@ impl Vosr {
                 let px = self.decoder.forward(&ltile)?;
                 let (py, pxx) = (ly * AE_FACTOR, lx * AE_FACTOR);
                 let (pr, pd) = (hh - py - pt, ww - pxx - pt);
-                acc = (acc + (px * &g)?.pad_with_zeros(2, py, pr)?.pad_with_zeros(3, pxx, pd)?)?;
+                acc = (acc
+                    + (px * &g)?
+                        .pad_with_zeros(2, py, pr)?
+                        .pad_with_zeros(3, pxx, pd)?)?;
                 wacc = (wacc + g.pad_with_zeros(2, py, pr)?.pad_with_zeros(3, pxx, pd)?)?;
             }
         }
@@ -273,10 +287,12 @@ impl Vosr {
         seed: u64,
         on_progress: &mut dyn FnMut(f32),
     ) -> Result<Tensor> {
+        let mut timer = PhaseTimer::start(&self.device, self.dit.attention_name())?;
         let lq: Vec<f32> = hr.iter().map(|v| v * 2.0 - 1.0).collect();
         let lq = Tensor::from_vec(lq, (1, 3, hh, ww), &self.device)?.to_dtype(self.dtype)?;
         let lq_latent = (self.encode_tiled(&lq, hh, ww)? * SCALING_FACTOR)?;
         let (_, _, lh, lw) = lq_latent.dims4()?;
+        timer.finish("encode")?;
 
         // `opts.tile`/`opts.overlap` are low-res pixel sizes; the ×4 upscale makes
         // the HR tile `opts.tile * SCALE`, which the reference maps to a latent
@@ -297,14 +313,22 @@ impl Vosr {
 
         // DINOv2 features per tile from the matching HR pixel region.
         let mut feats: HashMap<(usize, usize), Tensor> = HashMap::new();
+        let mut weak_ctx = None;
         for &hi in &h_pos {
             for &wi in &w_pos {
                 let (y0, y1) = (hi * AE_FACTOR, ((hi + lt) * AE_FACTOR).min(hh));
                 let (x0, x1) = (wi * AE_FACTOR, ((wi + lt) * AE_FACTOR).min(ww));
                 let crop = crop_chw(hr, 3, hh, ww, y0, y1, x0, x1);
-                feats.insert((hi, wi), self.dino_features(&crop, y1 - y0, x1 - x0)?);
+                let raw = self.dino_features(&crop, y1 - y0, x1 - x0)?;
+                if weak_ctx.is_none() {
+                    weak_ctx = Some(self.dit.project_context(&raw.zeros_like()?)?);
+                }
+                feats.insert((hi, wi), self.dit.project_context(&raw)?);
             }
         }
+        let weak_ctx = weak_ctx
+            .ok_or_else(|| candle_core::Error::Msg("VOSR tile grid is empty".to_owned()))?;
+        timer.finish("dinov2")?;
 
         let lq_weak = (&lq_latent * WEAK_COND_STRENGTH)?;
         let g = gaussian_mask(lt, 4, &self.device, self.dtype)?;
@@ -312,8 +336,8 @@ impl Vosr {
         let noise = gaussian(seed, 4 * lh * lw);
         let mut z = Tensor::from_vec(noise, (1, 4, lh, lw), &self.device)?.to_dtype(self.dtype)?;
 
-        // Flatten the tile grid so tiles run through the DiT in batches (one
-        // forward per `DIT_TILE_BATCH` tiles) instead of one forward per tile.
+        // Flatten the tile grid so tiles run through the DiT in batches instead
+        // of one forward per tile.
         let positions: Vec<(usize, usize)> = h_pos
             .iter()
             .flat_map(|&hi| w_pos.iter().map(move |&wi| (hi, wi)))
@@ -328,27 +352,32 @@ impl Vosr {
 
             let mut u_acc = Tensor::zeros((1, 4, lh, lw), self.dtype, &self.device)?;
             let mut w_acc = u_acc.clone();
-            for chunk in positions.chunks(DIT_TILE_BATCH) {
+            for chunk in positions.chunks(opts.batch.max(1)) {
                 let mut conds = Vec::with_capacity(chunk.len());
                 let mut weaks = Vec::with_capacity(chunk.len());
                 let mut ctxs = Vec::with_capacity(chunk.len());
                 for &(hi, wi) in chunk {
                     let z_t = z.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
-                    let cond_lat = lq_latent.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
+                    let cond_lat = lq_latent
+                        .narrow(2, hi, lt)?
+                        .narrow(3, wi, lt)?
+                        .contiguous()?;
                     let weak_lat = lq_weak.narrow(2, hi, lt)?.narrow(3, wi, lt)?.contiguous()?;
                     conds.push(Tensor::cat(&[&cond_lat, &z_t], 1)?);
                     weaks.push(Tensor::cat(&[&weak_lat, &z_t], 1)?);
                     ctxs.push(feats[&(hi, wi)].clone());
                 }
-                let u_batch = self.tiles_velocity(&conds, &weaks, &ctxs, t_cur)?;
+                let u_batch = self.tiles_velocity(&conds, &weaks, &ctxs, &weak_ctx, t_cur)?;
                 for (i, &(hi, wi)) in chunk.iter().enumerate() {
                     let u = u_batch.narrow(0, i, 1)?;
                     let contrib = (u * &g)?
                         .pad_with_zeros(2, hi, lh - hi - lt)?
                         .pad_with_zeros(3, wi, lw - wi - lt)?;
-                    let wpad = g
-                        .pad_with_zeros(2, hi, lh - hi - lt)?
-                        .pad_with_zeros(3, wi, lw - wi - lt)?;
+                    let wpad = g.pad_with_zeros(2, hi, lh - hi - lt)?.pad_with_zeros(
+                        3,
+                        wi,
+                        lw - wi - lt,
+                    )?;
                     u_acc = (u_acc + contrib)?;
                     w_acc = (w_acc + wpad)?;
                 }
@@ -356,10 +385,12 @@ impl Vosr {
             z = (z - (u_acc.div(&w_acc)?.affine(dt, 0.0))?)?;
             on_progress((step + 1) as f32 / n_steps as f32);
         }
+        timer.finish("dit")?;
 
         let decoded = self
             .decode_tiled(&(z / SCALING_FACTOR)?, lh, lw)?
             .clamp(-1f32, 1f32)?;
+        timer.finish("decode")?;
         decoded.affine(0.5, 0.5)
     }
 }

@@ -5,9 +5,11 @@
 //! DINOv2 layer-8 features, and a distilled LightDecoder decodes the result. See
 //! [`pipeline`] for the end-to-end flow.
 
+mod attention;
 mod dino;
 mod dit;
 pub mod pipeline;
+mod profile;
 mod vae;
 
 pub use pipeline::Vosr;

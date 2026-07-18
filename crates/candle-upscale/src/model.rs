@@ -9,7 +9,7 @@ use candle_core::{DType, Device, Result};
 /// fields they use (e.g. a one-step model ignores `steps`).
 #[derive(Clone, Debug)]
 pub struct UpscaleOptions {
-    /// DDIM steps (more = slower, sharper).
+    /// Sampler steps (more = slower; model-dependent quality trade-off).
     pub steps: usize,
     /// Low-res conditioning noise level `0..=350`. Lower = more faithful.
     pub noise_level: i64,
@@ -69,6 +69,25 @@ pub enum ModelId {
     Vosr,
     /// The TVT one-step latent upscaler.
     Tvt,
+}
+
+impl ModelId {
+    /// The CLI's sampler-step default for this model.
+    pub fn default_steps(self) -> usize {
+        match self {
+            Self::Sdx4 => 20,
+            Self::Vosr => 4,
+            Self::Tvt => 1,
+        }
+    }
+
+    /// The CLI's model-forward tile-batch default for this model.
+    pub fn default_batch(self) -> usize {
+        match self {
+            Self::Vosr => 8,
+            Self::Sdx4 | Self::Tvt => 1,
+        }
+    }
 }
 
 /// A user intent that maps to a concrete model. The mapping is PROVISIONAL, to be
@@ -153,4 +172,21 @@ fn load_tvt(_cfg: &LoadConfig) -> Result<Box<dyn UpscaleModel>> {
     Err(candle_core::Error::Msg(
         "built without the tvt model (rebuild with --features model-tvt)".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelId;
+
+    #[test]
+    fn vosr_defaults_to_its_converged_step_count_and_batched_tiles() {
+        assert_eq!(ModelId::Vosr.default_steps(), 4);
+        assert_eq!(ModelId::Vosr.default_batch(), 8);
+    }
+
+    #[test]
+    fn sdx4_retains_its_existing_defaults() {
+        assert_eq!(ModelId::Sdx4.default_steps(), 20);
+        assert_eq!(ModelId::Sdx4.default_batch(), 1);
+    }
 }

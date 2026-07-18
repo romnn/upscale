@@ -18,6 +18,7 @@
 //! falls back to its CPU backend, which keeps the crate compiling toolkit-free
 //! for lint/CI (the models run, just slowly).
 
+#[cfg(any(feature = "sdx4", feature = "tvt", feature = "vosr"))]
 mod common;
 pub mod device;
 pub mod manifest;

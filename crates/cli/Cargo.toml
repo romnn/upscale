@@ -9,18 +9,32 @@ publish = false
 [lints]
 workspace = true
 
-# `cuda`/`metal` need a GPU toolkit, which CI / cross-target lint lacks. The
-# model features are toolkit-free (they gate candle model code), so the base
-# config still exercises every model on candle's CPU backend.
+# Vary every model feature on every target. CUDA is Linux-only in this matrix;
+# Metal is macOS-only. The default model umbrella is redundant with the
+# explicit all-model combination; native backends come from target dependencies.
 [package.metadata.cargo-fc]
-exclude_features = ["cuda", "metal"]
+exclude_features = ["default"]
+# Cargo unifies target-specific backend dependencies across simultaneous target
+# arguments, so this package must preserve one real backend graph per invocation.
+aggregate_targets = false
+
+[package.metadata.cargo-fc.target.'cfg(target_os = "linux")']
+exclude_features = { add = ["cuda"] }
+
+[package.metadata.cargo-fc.target.'cfg(target_os = "macos")']
+exclude_features = { add = ["metal"] }
+
+[package.metadata.cargo-fc.target.'cfg(not(target_os = "linux"))']
+exclude_features = { add = ["cuda"] }
+
+[package.metadata.cargo-fc.target.'cfg(not(target_os = "macos"))']
+exclude_features = { add = ["metal"] }
 
 [[bin]]
 name = "sd-upscale"
 path = "src/main.rs"
 
 [dependencies]
-candle-upscale = { path = "../candle-upscale", default-features = false }
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 anyhow = "1"
@@ -31,10 +45,24 @@ ureq = "2"
 # OS-appropriate cache dir (`~/.cache` on Linux) for the downloaded weights.
 dirs = "6"
 
+# Cargo features cannot select different defaults by target. Put the CLI's
+# native backend on the target dependency instead so a plain build gets CUDA on
+# Linux, Metal on macOS, and no unsupported GPU dependency elsewhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+candle-upscale = { path = "../candle-upscale", default-features = false, features = ["cuda"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-upscale = { path = "../candle-upscale", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
+candle-upscale = { path = "../candle-upscale", default-features = false }
+
 [features]
 default = ["model-sdx4", "model-vosr", "model-tvt"]
 model-sdx4 = ["candle-upscale/sdx4"]
 model-vosr = ["candle-upscale/vosr"]
 model-tvt = ["candle-upscale/tvt"]
+# Keep the explicit flags compatible with existing build commands; plain CLI
+# builds already select the supported native backend in the target tables.
 cuda = ["candle-upscale/cuda"]
 metal = ["candle-upscale/metal"]

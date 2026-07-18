@@ -2,9 +2,11 @@
 //! conversion, the tile-geometry planner, and seam-blended accumulation of
 //! decoded output tiles.
 
+#[cfg(feature = "sdx4")]
 use candle_core::{DType, Device, Result, Tensor};
 
 /// RGBA8 `[h*w*4]` → `[1, 3, h, w]` in `[0, 1]` at the compute dtype (drops alpha).
+#[cfg(feature = "sdx4")]
 pub(crate) fn rgba_to_tensor(
     rgba: &[u8],
     width: usize,
@@ -56,6 +58,7 @@ pub(crate) fn tile_origins(
 
 /// Add a decoded output tile's CHW `vals` (`[3, th, tw]`) into the accumulation
 /// buffers at pixel offset `(ox, oy)`, one weight unit per covered pixel.
+#[cfg(feature = "sdx4")]
 pub(crate) fn accumulate(
     out: &mut [f32],
     weight: &mut [f32],
@@ -80,7 +83,13 @@ pub(crate) fn accumulate(
 
 /// Divide the accumulated `out` by the per-pixel `weight`, clamp to `[0, 1]`, and
 /// pack into an opaque RGBA8 buffer.
-pub(crate) fn normalize_to_rgba(out: &[f32], weight: &[f32], width: usize, height: usize) -> Vec<u8> {
+#[cfg(feature = "sdx4")]
+pub(crate) fn normalize_to_rgba(
+    out: &[f32],
+    weight: &[f32],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     for px in 0..width * height {
         let w = weight[px].max(1.0);

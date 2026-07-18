@@ -1,3 +1,5 @@
+/.candle-flash-attn/*
+!/.candle-flash-attn/.gitkeep
 /target
 
 # Golden-tensor test fixtures (~27 MB) are derived artifacts: regenerate with

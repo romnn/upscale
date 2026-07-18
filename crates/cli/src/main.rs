@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! cargo run --release -p cli -- -i in.png -o out.png --steps 20
-//! cargo run --release -p cli --features cuda -- -i in.png --model sdx4
+//! cargo run --release -p cli -- -i in.png --model sdx4
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -184,9 +184,9 @@ struct Args {
     /// Explicit VAE safetensors path (overrides `--models-dir`).
     #[arg(long)]
     vae: Option<PathBuf>,
-    /// DDIM denoising steps (more = slower, sharper).
-    #[arg(long, default_value_t = 20)]
-    steps: usize,
+    /// Sampler steps. Defaults to 4 for VOSR, 20 for SD-x4, and 1 for TVT.
+    #[arg(long)]
+    steps: Option<usize>,
     /// Low-res conditioning noise level (`0..=350`; lower = more faithful).
     #[arg(long, default_value_t = 20)]
     noise_level: i64,
@@ -197,10 +197,10 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     overlap: usize,
     /// Tiles per model forward. Higher fills the GPU for a large speedup but needs
-    /// proportionally more free VRAM. Lower `--batch` (or free GPU memory) if a
-    /// batch runs out of memory.
-    #[arg(long, default_value_t = 1)]
-    batch: usize,
+    /// proportionally more free VRAM. Defaults to 8 for VOSR and 1 for the other
+    /// models. Lower `--batch` (or free GPU memory) if a batch runs out of memory.
+    #[arg(long)]
+    batch: Option<usize>,
     /// Center-crop the input to this many pixels before upscaling (handy for a
     /// quick single-tile benchmark).
     #[arg(long)]
@@ -450,11 +450,17 @@ fn run_upscale(args: Args) -> anyhow::Result<()> {
     // Validate `--input` up front so a missing path fails immediately rather than
     // after a first-run weight download.
     args.input_path()?;
-    // The scheduler indexes `alphas_cumprod` (len 1000) by step-derived timesteps
-    // and by `noise_level`. Reject inputs that would index out of bounds or skip
-    // denoising entirely and emit pure noise.
-    if !(1..1000).contains(&args.steps) {
-        bail!("--steps must be in 1..=999 (got {})", args.steps);
+    let id = resolve_model(&args)?;
+    let steps = args.steps.unwrap_or_else(|| id.default_steps());
+    let batch = args.batch.unwrap_or_else(|| id.default_batch());
+
+    // The shared upper bound keeps the value valid for SD-x4's 1000-entry
+    // scheduler; every iterative model requires at least one step.
+    if !(1..1000).contains(&steps) {
+        bail!("--steps must be in 1..=999 (got {steps})");
+    }
+    if batch == 0 {
+        bail!("--batch must be at least 1");
     }
     if !(0..=350).contains(&args.noise_level) {
         bail!("--noise-level must be in 0..=350 (got {})", args.noise_level);
@@ -470,7 +476,6 @@ fn run_upscale(args: Args) -> anyhow::Result<()> {
     }
 
     let quiet = args.quiet;
-    let id = resolve_model(&args)?;
     let dtype_choice = args.dtype.unwrap_or(DtypeChoice::Bf16);
     let dtype = match dtype_choice {
         DtypeChoice::F32 => candle_upscale::DType::F32,
@@ -497,17 +502,17 @@ fn run_upscale(args: Args) -> anyhow::Result<()> {
 
     let (rgba, w, h) = prepare_input(&args)?;
     let opts = candle_upscale::UpscaleOptions {
-        steps: args.steps,
+        steps,
         noise_level: args.noise_level,
         tile: args.tile,
         overlap: args.overlap,
-        batch: args.batch,
+        batch,
     };
     if !quiet {
         eprintln!(
             "upscaling {} ({} steps, noise {}, {})…",
             scale_desc(w, h, &args),
-            args.steps,
+            steps,
             args.noise_level,
             dtype_choice.as_str(),
         );

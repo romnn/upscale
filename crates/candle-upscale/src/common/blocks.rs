@@ -7,9 +7,15 @@
 //! port — no transpose is needed, and GroupNorm/LayerNorm keep the PyTorch
 //! `weight`/`bias` names.
 
-use candle_core::{Module, Result, Tensor, D};
-use candle_nn::ops::{silu, softmax};
-use candle_nn::{conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear, VarBuilder};
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
+use candle_core::D;
+use candle_core::{Module, Result, Tensor};
+use candle_nn::ops::silu;
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
+use candle_nn::ops::softmax;
+use candle_nn::{conv2d, group_norm, Conv2d, Conv2dConfig, GroupNorm, VarBuilder};
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
+use candle_nn::{linear, Linear};
 
 /// Shape-preserving 3x3 conv (`padding=1`), the workhorse conv of the VAE/UNet.
 pub(crate) fn conv3x3(in_ch: usize, out_ch: usize, vb: VarBuilder) -> Result<Conv2d> {
@@ -80,12 +86,14 @@ impl ResnetBlock2D {
 /// of batch, versus the ~1 GB a full `[B, HW, HW]` matrix would need at a 128px
 /// tile. Splitting the query rows is exact: each row's softmax runs over all
 /// keys independently.
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
 const ATTN_ROW_BUDGET: usize = 2048;
 
 /// Spatial self-attention used in the VAE mid-block (single head, old diffusers
 /// `query`/`key`/`value`/`proj_attn` naming that the fp32 checkpoint stores; the
 /// fp16 re-export uses `to_q`/`to_k`/`to_v`/`to_out.0`, both handled here).
 #[derive(Debug)]
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
 pub(crate) struct AttnBlock {
     group_norm: GroupNorm,
     query: Linear,
@@ -95,6 +103,7 @@ pub(crate) struct AttnBlock {
     channels: usize,
 }
 
+#[cfg(any(feature = "sdx4", feature = "vosr"))]
 impl AttnBlock {
     pub(crate) fn new(channels: usize, groups: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         // The fp32 checkpoint names the projections query/key/value/proj_attn;

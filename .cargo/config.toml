@@ -1,5 +1,11 @@
 [env]
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
+# Flash-attention compiles a large set of CUDA translation units. Keeping its
+# build directory stable lets cudaforge reuse them across Cargo rebuilds, while
+# bounding parallel NVCC jobs avoids exhausting tmpfs on GPU workstations.
+CANDLE_FLASH_ATTN_BUILD_DIR = { value = ".candle-flash-attn", relative = true, force = false }
+CUDAFORGE_THREADS = { value = "8", force = false }
+TMPDIR = { value = ".candle-flash-attn", relative = true, force = false }
 
 [alias]
 c = "check --all-targets"
