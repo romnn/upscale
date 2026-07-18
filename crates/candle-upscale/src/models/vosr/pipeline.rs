@@ -36,6 +36,13 @@ const AE_FACTOR: usize = 8;
 const PATCH: usize = 2;
 /// Variance of the Gaussian blend mask (`_gaussian_weights`).
 const BLEND_VAR: f64 = 0.01;
+/// Latent-space tile size for the VAE encode/decode, so their activations stay
+/// bounded on large images instead of processing the full frame at once. `64`
+/// latent = a 512×512 pixel tile (the autoencoder's comfortable size); tiles
+/// overlap and are Gaussian-blended, so the stitched result is seam-free.
+const VAE_LAT_TILE: usize = 64;
+/// Latent-space overlap between adjacent VAE tiles.
+const VAE_LAT_OVERLAP: usize = 8;
 
 fn io_err(context: &str, e: std::io::Error) -> candle_core::Error {
     candle_core::Error::Msg(format!("{context}: {e}"))
@@ -160,9 +167,10 @@ fn tile_grid(length: usize, tile: usize, overlap: usize) -> Vec<usize> {
     pos
 }
 
-/// Gaussian blend mask `[1, 4, tile, tile]` peaked at the centre
-/// (`_gaussian_weights`).
-fn gaussian_weights(tile: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+/// Gaussian blend mask `[1, channels, tile, tile]` peaked at the centre
+/// (`_gaussian_weights`). Feathers overlapping tiles: the 4-channel latent in the
+/// DiT loop and the VAE encode, the 3-channel image in the VAE decode.
+fn gaussian_mask(tile: usize, channels: usize, device: &Device, dtype: DType) -> Result<Tensor> {
     let mid = (tile as f64 - 1.0) / 2.0;
     let axis: Vec<f64> = (0..tile)
         .map(|i| (-((i as f64 - mid) / tile as f64).powi(2) / (2.0 * BLEND_VAR)).exp())
@@ -174,7 +182,7 @@ fn gaussian_weights(tile: usize, device: &Device, dtype: DType) -> Result<Tensor
         }
     }
     Tensor::from_vec(w, (1, 1, tile, tile), device)?
-        .broadcast_as((1, 4, tile, tile))?
+        .broadcast_as((1, channels, tile, tile))?
         .to_dtype(dtype)?
         .contiguous()
 }
@@ -194,6 +202,56 @@ fn crop_chw(src: &[f32], c: usize, h: usize, w: usize, y0: usize, y1: usize, x0:
 }
 
 impl Vosr {
+    /// VAE-encode the HR conditioning image tile-by-tile so the encoder's
+    /// activations stay bounded on large frames, returning the stitched mean
+    /// latent `[1, 4, hh/8, ww/8]` (unscaled). Latent-aligned tiles overlap and
+    /// are Gaussian-blended, so the result is seam-free.
+    fn encode_tiled(&self, hr: &Tensor, hh: usize, ww: usize) -> Result<Tensor> {
+        let (lh, lw) = (hh / AE_FACTOR, ww / AE_FACTOR);
+        let lt = VAE_LAT_TILE.min(lh).min(lw).max(1);
+        let lo = VAE_LAT_OVERLAP.min(lt.saturating_sub(1));
+        let g = gaussian_mask(lt, 4, &self.device, self.dtype)?;
+        let mut acc = Tensor::zeros((1, 4, lh, lw), self.dtype, &self.device)?;
+        let mut wacc = acc.clone();
+        for &ly in &tile_grid(lh, lt, lo) {
+            for &lx in &tile_grid(lw, lt, lo) {
+                let ptile = hr
+                    .narrow(2, ly * AE_FACTOR, lt * AE_FACTOR)?
+                    .narrow(3, lx * AE_FACTOR, lt * AE_FACTOR)?
+                    .contiguous()?;
+                let lat = self.encoder.encode_mean(&ptile)?;
+                let (pr, pd) = (lh - ly - lt, lw - lx - lt);
+                acc = (acc + (lat * &g)?.pad_with_zeros(2, ly, pr)?.pad_with_zeros(3, lx, pd)?)?;
+                wacc = (wacc + g.pad_with_zeros(2, ly, pr)?.pad_with_zeros(3, lx, pd)?)?;
+            }
+        }
+        acc.div(&wacc)
+    }
+
+    /// VAE-decode the latent tile-by-tile through the LightDecoder so its
+    /// activations stay bounded, returning the image `[1, 3, lh*8, lw*8]` in
+    /// `[-1, 1]`. Tiles overlap and are Gaussian-blended in pixel space.
+    fn decode_tiled(&self, latent: &Tensor, lh: usize, lw: usize) -> Result<Tensor> {
+        let (hh, ww) = (lh * AE_FACTOR, lw * AE_FACTOR);
+        let lt = VAE_LAT_TILE.min(lh).min(lw).max(1);
+        let lo = VAE_LAT_OVERLAP.min(lt.saturating_sub(1));
+        let pt = lt * AE_FACTOR;
+        let g = gaussian_mask(pt, 3, &self.device, self.dtype)?;
+        let mut acc = Tensor::zeros((1, 3, hh, ww), self.dtype, &self.device)?;
+        let mut wacc = acc.clone();
+        for &ly in &tile_grid(lh, lt, lo) {
+            for &lx in &tile_grid(lw, lt, lo) {
+                let ltile = latent.narrow(2, ly, lt)?.narrow(3, lx, lt)?.contiguous()?;
+                let px = self.decoder.forward(&ltile)?;
+                let (py, pxx) = (ly * AE_FACTOR, lx * AE_FACTOR);
+                let (pr, pd) = (hh - py - pt, ww - pxx - pt);
+                acc = (acc + (px * &g)?.pad_with_zeros(2, py, pr)?.pad_with_zeros(3, pxx, pd)?)?;
+                wacc = (wacc + g.pad_with_zeros(2, py, pr)?.pad_with_zeros(3, pxx, pd)?)?;
+            }
+        }
+        acc.div(&wacc)
+    }
+
     /// Run the full pipeline on an HR conditioning image (planar `[3, hh, ww]`
     /// in `[0, 1]`), returning the decoded image tensor `[1, 3, hh, ww]` in
     /// `[0, 1]`.
@@ -208,7 +266,7 @@ impl Vosr {
     ) -> Result<Tensor> {
         let lq: Vec<f32> = hr.iter().map(|v| v * 2.0 - 1.0).collect();
         let lq = Tensor::from_vec(lq, (1, 3, hh, ww), &self.device)?.to_dtype(self.dtype)?;
-        let lq_latent = (self.encoder.encode_mean(&lq)? * SCALING_FACTOR)?;
+        let lq_latent = (self.encode_tiled(&lq, hh, ww)? * SCALING_FACTOR)?;
         let (_, _, lh, lw) = lq_latent.dims4()?;
 
         // `opts.tile`/`opts.overlap` are low-res pixel sizes; the ×4 upscale makes
@@ -240,7 +298,7 @@ impl Vosr {
         }
 
         let lq_weak = (&lq_latent * WEAK_COND_STRENGTH)?;
-        let g = gaussian_weights(lt, &self.device, self.dtype)?;
+        let g = gaussian_mask(lt, 4, &self.device, self.dtype)?;
 
         let noise = gaussian(seed, 4 * lh * lw);
         let mut z = Tensor::from_vec(noise, (1, 4, lh, lw), &self.device)?.to_dtype(self.dtype)?;
@@ -280,7 +338,9 @@ impl Vosr {
             on_progress((step + 1) as f32 / n_steps as f32);
         }
 
-        let decoded = self.decoder.forward(&(z / SCALING_FACTOR)?)?.clamp(-1f32, 1f32)?;
+        let decoded = self
+            .decode_tiled(&(z / SCALING_FACTOR)?, lh, lw)?
+            .clamp(-1f32, 1f32)?;
         decoded.affine(0.5, 0.5)
     }
 }
