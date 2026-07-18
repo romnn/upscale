@@ -49,12 +49,11 @@ async fn fetch_part(
     part: ModelPart,
     url: &str,
     status: RwSignal<Status>,
-) -> Result<Rc<Vec<u8>>, String> {
-    let bytes = model_cache::load_model_bytes(url, |s| {
+) -> Result<Vec<u8>, String> {
+    model_cache::load_model_bytes(url, |s| {
         status.set(Status::LoadingModel(part, s));
     })
-    .await?;
-    Ok(Rc::new(bytes))
+    .await
 }
 
 #[component]
@@ -75,22 +74,24 @@ pub fn App() -> impl IntoView {
     let busy = RwSignal::new(false);
     let dragover = RwSignal::new(false);
 
-    // Non-reactive caches, kept across repeated "Upscale" clicks so the
-    // ~2 GB of downloads + safetensors parsing only happens once per page
-    // load. `StoredValue<_, LocalStorage>` (rather than a signal) because
-    // neither holding the bytes nor the constructed `Upscaler` should
-    // trigger a re-render, and `Upscaler<Wgpu>` isn't `Send`/`Sync` (wasm is
-    // single-threaded, so that's fine — `LocalStorage` is exactly the
-    // opt-out for that).
-    let unet_bytes: StoredValue<Option<Rc<Vec<u8>>>, LocalStorage> = StoredValue::new_local(None);
-    let vae_bytes: StoredValue<Option<Rc<Vec<u8>>>, LocalStorage> = StoredValue::new_local(None);
-    // `Rc` so we can clone a handle out of the scoped `with_value` borrow and
-    // hold it across the `.await` of the (async) upscale.
+    // Non-reactive cache of the built pipeline, kept across repeated "Upscale"
+    // clicks so the ~2 GB download + safetensors parse only happens once per
+    // page load. The raw model bytes are deliberately *not* retained: they're
+    // consumed by `load_full` and freed once the pipeline is built (holding them
+    // too would double peak memory past the wasm32 4 GB limit), and the browser
+    // Cache Storage already persists the download for a rebuild.
+    //
+    // `StoredValue<_, LocalStorage>` (rather than a signal) because holding the
+    // constructed `Upscaler` shouldn't trigger a re-render, and `Upscaler<Wgpu>`
+    // isn't `Send`/`Sync` (wasm is single-threaded, so that's fine — `Rc` +
+    // `LocalStorage` is exactly the opt-out for that). `Rc` so we can clone a
+    // handle out of the scoped `with_value` borrow and hold it across the
+    // `.await` of the (async) upscale.
     let upscaler: StoredValue<Option<Rc<Upscaler<Wgpu>>>, LocalStorage> =
         StoredValue::new_local(None);
-    // Which precision the cached bytes/pipeline above were built for, so
-    // toggling fp16 mid-session reloads the right weights instead of reusing
-    // the wrong ones.
+    // Which precision the cached pipeline was built for, so toggling fp16
+    // mid-session rebuilds with the right weights instead of reusing the wrong
+    // ones.
     let loaded_half: StoredValue<Option<bool>, LocalStorage> = StoredValue::new_local(None);
 
     let load_file = move |file: web_sys::File| {
@@ -157,12 +158,10 @@ pub fn App() -> impl IntoView {
             ..UpscaleOptions::default()
         };
 
-        // Switching precision means the cached bytes/pipeline are for the wrong
-        // weights — drop them so they re-fetch (the browser cache still keys the
-        // two URLs separately, so each precision downloads at most once).
+        // Switching precision means the cached pipeline is for the wrong weights
+        // — drop it so it rebuilds (the browser cache keys the two precisions'
+        // URLs separately, so each downloads at most once).
         if loaded_half.with_value(|h| *h != Some(half)) {
-            unet_bytes.set_value(None);
-            vae_bytes.set_value(None);
             upscaler.set_value(None);
             loaded_half.set_value(Some(half));
         }
@@ -179,44 +178,35 @@ pub fn App() -> impl IntoView {
                 return;
             }
 
-            if unet_bytes.with_value(Option::is_none) {
-                match fetch_part(ModelPart::Unet, &unet_url, status).await {
-                    Ok(bytes) => unet_bytes.set_value(Some(bytes)),
+            // Only fetch + build when there's no cached pipeline. The fetched
+            // bytes stay in local variables and are moved into `load_full`, which
+            // consumes and frees them as it loads — so wasm never holds the raw
+            // UNet buffer and a copy at the same time.
+            if upscaler.with_value(Option::is_none) {
+                let unet = match fetch_part(ModelPart::Unet, &unet_url, status).await {
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         status.set(Status::Error(format!("UNet download failed: {e}")));
                         busy.set(false);
                         return;
                     }
-                }
-            }
-            if vae_bytes.with_value(Option::is_none) {
-                match fetch_part(ModelPart::Vae, &vae_url, status).await {
-                    Ok(bytes) => vae_bytes.set_value(Some(bytes)),
+                };
+                let vae = match fetch_part(ModelPart::Vae, &vae_url, status).await {
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         status.set(Status::Error(format!("VAE download failed: {e}")));
                         busy.set(false);
                         return;
                     }
-                }
-            }
-
-            let need_build = upscaler.with_value(Option::is_none);
-            if need_build {
-                let unet = unet_bytes
-                    .with_value(Clone::clone)
-                    .expect("just populated above");
-                let vae = vae_bytes
-                    .with_value(Clone::clone)
-                    .expect("just populated above");
+                };
                 status.set(Status::BuildingPipeline);
-                let built = Upscaler::<Wgpu>::load_full(
-                    &unet,
-                    &vae,
+                match Upscaler::<Wgpu>::load_full(
+                    unet,
+                    vae,
                     EMPTY_PROMPT_EMBED,
                     half,
                     WgpuDevice::default(),
-                );
-                match built {
+                ) {
                     Ok(up) => upscaler.set_value(Some(Rc::new(up))),
                     Err(e) => {
                         status.set(Status::Error(format!("failed to build pipeline: {e}")));
