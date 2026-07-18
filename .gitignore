@@ -1,3 +1,4 @@
+/plan
 /.candle-flash-attn/*
 !/.candle-flash-attn/.gitkeep
 /target
