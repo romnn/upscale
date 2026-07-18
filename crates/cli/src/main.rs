@@ -9,12 +9,14 @@
 //! cargo run --release -p cli --features cuda -- -i in.png --model sdx4
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+
+mod download;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum DtypeChoice {
@@ -86,12 +88,59 @@ const NATIVE_SCALE: f32 = 4.0;
 /// Fixed seed for the per-tile noise, so a run is reproducible.
 const SEED: u64 = 0x5D5C_A1E0;
 
+/// Multi-model image upscaler (candle).
+///
+/// With no subcommand this upscales `--input`; the `cache` subcommand manages the
+/// downloaded-weights cache instead.
 #[derive(Parser)]
-#[command(about = "Multi-model image upscaler (candle).")]
+#[command(
+    about = "Multi-model image upscaler (candle).",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
+struct Cli {
+    /// Optional subcommand. Omit to run the upscaler (the default action).
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// The upscale arguments, used when no subcommand is given.
+    #[command(flatten)]
+    upscale: Args,
+}
+
+/// Top-level subcommands. Absent for the default upscale action.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Inspect or clear the downloaded-weights cache.
+    Cache {
+        /// The cache action to perform.
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+/// Actions for the `cache` subcommand.
+#[derive(clap::Subcommand)]
+enum CacheAction {
+    /// Delete cached weights and report the bytes freed. With `--model`, only
+    /// that model's weights are removed; otherwise the whole cache directory.
+    Clean {
+        /// Restrict the cleanup to a single model's weights.
+        #[arg(long, value_enum)]
+        model: Option<ModelChoice>,
+    },
+    /// Print the cache directory path, for manual inspection or removal.
+    Dir,
+}
+
+/// Arguments for the default upscale action.
+#[derive(clap::Args)]
 struct Args {
-    /// Input image (PNG or JPEG).
+    /// Input image (PNG or JPEG). Required for the upscale action — optional at
+    /// the parse layer only so a bare `cache` subcommand does not demand it
+    /// (clap's `subcommand_negates_reqs` does not reach `#[command(flatten)]`
+    /// args), then validated by [`Args::input_path`].
     #[arg(short, long)]
-    input: PathBuf,
+    input: Option<PathBuf>,
     /// Output path. PNG or JPEG, chosen by the file extension.
     #[arg(short, long, default_value = "upscaled.png")]
     output: PathBuf,
@@ -123,10 +172,12 @@ struct Args {
     /// detail.
     #[arg(long)]
     fast: bool,
-    /// Directory holding `unet.safetensors` / `vae.safetensors`. Ignored for a
-    /// part when its explicit `--unet` / `--vae` is set.
-    #[arg(long, default_value = "crates/web/models")]
-    models_dir: PathBuf,
+    /// Directory holding the model's weight files. When omitted, the weights are
+    /// downloaded from Hugging Face to a per-model cache dir on first run (and
+    /// reused after), except for `--model tvt`, whose weights are prepared
+    /// offline. Ignored for a part when its explicit `--unet` / `--vae` is set.
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
     /// Explicit UNet safetensors path (overrides `--models-dir`).
     #[arg(long)]
     unet: Option<PathBuf>,
@@ -177,6 +228,15 @@ impl Args {
     fn post_shrink(&self) -> f32 {
         if self.fast { 1.0 } else { self.shrink() }
     }
+
+    /// The validated input path. `--input` is parsed as optional (see the field
+    /// doc) so the `cache` subcommand need not supply it; the upscale action
+    /// requires it, so a missing value is a clear error rather than a panic.
+    fn input_path(&self) -> anyhow::Result<&Path> {
+        self.input
+            .as_deref()
+            .ok_or_else(|| anyhow!("--input <INPUT> is required"))
+    }
 }
 
 /// Resolve which model to load from `--model` / `--preset`.
@@ -191,6 +251,38 @@ fn resolve_model(args: &Args) -> anyhow::Result<candle_upscale::ModelId> {
         (Some(m), None) => Ok(m.model_id()),
         (None, Some(p)) => Ok(p.preset().model()),
         (None, None) => Ok(candle_upscale::Preset::Document.model()),
+    }
+}
+
+/// The cache sub-directory name for a model's downloaded weights (also the label
+/// in the download note). Stable across builds so the cache is reused.
+fn model_dir_name(id: candle_upscale::ModelId) -> &'static str {
+    match id {
+        candle_upscale::ModelId::Sdx4 => "sdx4",
+        candle_upscale::ModelId::Vosr => "vosr",
+        candle_upscale::ModelId::Tvt => "tvt",
+    }
+}
+
+/// Resolve the directory the model loads its weights from.
+///
+/// With `--models-dir` set, that directory is used as-is (the dev workflow, no
+/// download). Without it, the model's [`manifest`](candle_upscale::ModelId::manifest)
+/// weights are downloaded to (and reused from) a per-model cache dir; a model
+/// with no manifest (tvt) has no auto-download path and errors with guidance.
+fn resolve_weights_root(
+    id: candle_upscale::ModelId,
+    args: &Args,
+) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = &args.models_dir {
+        return Ok(dir.clone());
+    }
+    match id.manifest() {
+        Some(files) => download::ensure_weights(model_dir_name(id), files, args.quiet),
+        None => bail!(
+            "--model tvt needs locally-prepared weights; pass --models-dir <dir> containing \
+             fused_unet.safetensors and vae.safetensors (auto-download not yet supported for tvt)"
+        ),
     }
 }
 
@@ -259,8 +351,9 @@ fn progress_bar(quiet: bool) -> anyhow::Result<Option<ProgressBar>> {
 /// the native ×4 pass lands at the requested net scale. Returns RGBA8 bytes plus
 /// width/height.
 fn prepare_input(args: &Args) -> anyhow::Result<(Vec<u8>, usize, usize)> {
-    let img = image::open(&args.input)
-        .with_context(|| format!("open input {}", args.input.display()))?
+    let input = args.input_path()?;
+    let img = image::open(input)
+        .with_context(|| format!("open input {}", input.display()))?
         .to_rgba8();
     let img = match args.crop {
         Some(c) => center_crop(img, c),
@@ -316,7 +409,47 @@ fn write_output(args: &Args, out: Vec<u8>, ow: usize, oh: usize) -> anyhow::Resu
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        None => run_upscale(cli.upscale),
+        Some(Command::Cache { action }) => run_cache(action),
+    }
+}
+
+/// Run the `cache` subcommand: print the cache path or clear cached weights.
+fn run_cache(action: CacheAction) -> anyhow::Result<()> {
+    match action {
+        CacheAction::Dir => {
+            println!("{}", download::cache_dir().display());
+            Ok(())
+        }
+        CacheAction::Clean { model } => run_cache_clean(model),
+    }
+}
+
+/// Remove cached weights (a single model's with `--model`, else the whole cache),
+/// reporting the freed size. A not-yet-cached target is a no-op, not an error.
+fn run_cache_clean(model: Option<ModelChoice>) -> anyhow::Result<()> {
+    let target = match model {
+        Some(m) => download::model_cache_dir(model_dir_name(m.model_id())),
+        None => download::cache_dir(),
+    };
+    if !target.exists() {
+        println!("nothing to clean: {} does not exist", target.display());
+        return Ok(());
+    }
+    let freed = download::dir_size(&target);
+    std::fs::remove_dir_all(&target)
+        .with_context(|| format!("remove {}", target.display()))?;
+    println!("removed {} (freed {})", target.display(), HumanBytes(freed));
+    Ok(())
+}
+
+/// Run the default upscale action for `args`.
+fn run_upscale(args: Args) -> anyhow::Result<()> {
+    // Validate `--input` up front so a missing path fails immediately rather than
+    // after a first-run weight download.
+    args.input_path()?;
     // The scheduler indexes `alphas_cumprod` (len 1000) by step-derived timesteps
     // and by `noise_level`. Reject inputs that would index out of bounds or skip
     // denoising entirely and emit pure noise.
@@ -345,10 +478,11 @@ fn main() -> anyhow::Result<()> {
     };
     let device = candle_upscale::select_device()?;
 
+    let weights_root = resolve_weights_root(id, &args)?;
     let cfg = candle_upscale::LoadConfig {
         device,
         dtype,
-        weights_root: args.models_dir.clone(),
+        weights_root,
         unet: args.unet.clone(),
         vae: args.vae.clone(),
     };

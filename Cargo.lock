@@ -1223,8 +1223,10 @@ dependencies = [
  "anyhow",
  "candle-upscale",
  "clap",
+ "dirs",
  "image",
  "indicatif",
+ "ureq",
 ]
 
 [[package]]

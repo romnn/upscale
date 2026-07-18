@@ -20,11 +20,13 @@
 
 mod common;
 pub mod device;
+pub mod manifest;
 pub mod model;
 pub mod models;
 
 pub use candle_core::{DType, Device};
 pub use device::select_device;
+pub use manifest::WeightFile;
 pub use model::{load_model, LoadConfig, ModelId, Preset, UpscaleModel, UpscaleOptions};
 
 #[cfg(feature = "cuda")]

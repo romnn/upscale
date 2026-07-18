@@ -25,6 +25,11 @@ clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 anyhow = "1"
 indicatif = "0.17"
+# Blocking HTTP for the first-run weight download. Default features pull rustls
+# TLS (no system OpenSSL needed), which is what HF's `resolve` links require.
+ureq = "2"
+# OS-appropriate cache dir (`~/.cache` on Linux) for the downloaded weights.
+dirs = "6"
 
 [features]
 default = ["model-sdx4", "model-vosr", "model-tvt"]
