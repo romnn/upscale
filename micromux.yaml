@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
+#
+# Web dev stack: the trunk wasm hot-reload server plus the static file server the
+# trunk proxy pulls model weights from. Run it with `micromux` from the repo root
+# (replaces the old `task web:dev` / `web:serve` / `web:models` targets).
+#
+# The two processes must agree on one thing or the app breaks in a confusing way:
+# the file server's document root has to be `crates/web/` (the PARENT of
+# `models/`), so a request the trunk proxy forwards as `/models/unet.safetensors`
+# resolves to `crates/web/models/unet.safetensors`. If the root is `models/`
+# itself the path becomes `models/models/...` -> 404, and the browser either sees
+# an HTTP 500 (proxy backend error) or, worse, caches a bad 200 body and then
+# fails to parse it as safetensors. The `models` healthcheck below HEAD-requests
+# exactly the proxied model URL, so a wrong root surfaces immediately as an
+# unhealthy service instead of biting later in the browser.
+version: "1"
+name: upscale-web
+services:
+  models:
+    name: model file server
+    # Serve crates/web/ (not crates/web/models/) so `/models/*.safetensors`
+    # resolves under the trunk proxy backend `http://127.0.0.1:8787/models/`.
+    command: "python3 -m http.server 8787"
+    working_dir: crates/web
+    ports:
+      - 8787
+    restart: unless-stopped
+    healthcheck:
+      # HEAD the real proxied URL: proves the doc root is correct without pulling
+      # the ~1.9 GB body. Fails loudly if the weights aren't reachable here.
+      test:
+        - CMD-SHELL
+        - "curl -fsS -I -o /dev/null http://127.0.0.1:8787/models/unet.safetensors || exit 1"
+      start_delay: "500ms"
+      interval: "2s"
+      timeout: "5s"
+      retries: 5
+
+  web:
+    name: trunk dev server
+    command: "trunk serve"
+    working_dir: crates/web
+    ports:
+      - 8788
+    restart: unless-stopped
+    # Wait until the file server actually serves the weights before starting, so
+    # the proxy never returns 500 for /models/* on the first upscale.
+    depends_on:
+      - name: models
+        condition: healthy
+    healthcheck:
+      # Trunk's first wasm build of the wgpu app is slow, so allow a long ramp-up
+      # (retries * interval) before calling it unhealthy.
+      test:
+        - CMD-SHELL
+        - "curl -fsS -o /dev/null http://127.0.0.1:8788/ || exit 1"
+      start_delay: "3s"
+      interval: "3s"
+      timeout: "5s"
+      retries: 40

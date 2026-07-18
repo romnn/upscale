@@ -4,9 +4,12 @@ task = "latest"
 ast-grep = "latest"
 typos = "latest"
 actionlint = "latest"
-# trunkrs.dev wasm bundler for the `web:serve` dev loop. Backend-qualified
-# because the bare `trunk` registry name resolves to trunk.io's linter instead.
+# trunkrs.dev wasm bundler for the web dev loop. Backend-qualified because the
+# bare `trunk` registry name resolves to trunk.io's linter instead.
 "github:trunk-rs/trunk" = "latest"
+
+# micromux runs the web dev stack (trunk + model file server) from micromux.yaml.
+"github:romnn/micromux" = "latest"
 
 "github:rust-cross/cargo-zigbuild" = "latest"
 "github:romnn/cargo-feature-combinations" = { version = "latest", matching = "cargo-fc" }
