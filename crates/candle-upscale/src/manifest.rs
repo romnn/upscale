@@ -66,20 +66,32 @@ const VOSR: &[WeightFile] = &[
     },
 ];
 
+/// TVT's runtime weights are pre-fused/converted (the TVT LoRA merged into the
+/// SD2.1 UNet, plus the VAE-D4 as a plain safetensors) and hosted ready-to-load;
+/// the dests match [`tvt::load`](crate::models::tvt)'s `ckp/…` sub-paths.
+const TVT: &[WeightFile] = &[
+    WeightFile {
+        url: "https://huggingface.co/romnnn/tvtsr-fused/resolve/main/fused_unet.safetensors",
+        dest: "ckp/fused_unet.safetensors",
+    },
+    WeightFile {
+        url: "https://huggingface.co/romnnn/tvtsr-fused/resolve/main/vae.safetensors",
+        dest: "ckp/vae.safetensors",
+    },
+];
+
 impl ModelId {
-    /// The set of weight files this model downloads on first run, or `None` when
-    /// its weights are derived locally (offline preprocessing) and cannot be
-    /// fetched from Hugging Face.
+    /// The set of weight files this model downloads on first run, or `None` for a
+    /// model whose weights are derived locally and not published (the CLI then
+    /// asks for `--models-dir`).
     ///
     /// The returned dests are relative to the model's `weights_root`, so writing
     /// each file to `<cache>/<dest>` yields a directory usable as `--models-dir`.
-    /// [`Tvt`](ModelId::Tvt) returns `None` — its fused UNet and VAE-D4 are
-    /// produced by an offline merge step, not published as ready-to-load blobs.
     pub fn manifest(self) -> Option<&'static [WeightFile]> {
         match self {
             ModelId::Sdx4 => Some(SDX4),
             ModelId::Vosr => Some(VOSR),
-            ModelId::Tvt => None,
+            ModelId::Tvt => Some(TVT),
         }
     }
 }
