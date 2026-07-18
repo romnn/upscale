@@ -152,7 +152,6 @@ impl Sdx4 {
         )?;
         self.decode_latents(&latents)
     }
-
 }
 
 /// Upscale by the SD-x4 model's fixed ×4 factor with seam-blended tiling.

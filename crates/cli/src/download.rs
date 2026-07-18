@@ -90,8 +90,7 @@ pub fn ensure_weights(model_name: &str, files: &[WeightFile], quiet: bool) -> Re
     }
     for file in missing {
         let dest = root.join(file.dest);
-        download_file(file.url, &dest, quiet)
-            .with_context(|| format!("download {}", file.url))?;
+        download_file(file.url, &dest, quiet).with_context(|| format!("download {}", file.url))?;
     }
     Ok(root)
 }
@@ -129,9 +128,10 @@ fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
         .header("Content-Length")
         .and_then(|len| len.parse().ok());
 
-    let name = dest
-        .file_name()
-        .map_or_else(|| dest.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let name = dest.file_name().map_or_else(
+        || dest.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let bar = if quiet {
         None
     } else {
@@ -140,8 +140,8 @@ fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
 
     let tmp = part_path(dest);
     let mut reader = resp.into_reader();
-    let mut file = fs::File::create(&tmp)
-        .with_context(|| format!("create temp {}", tmp.display()))?;
+    let mut file =
+        fs::File::create(&tmp).with_context(|| format!("create temp {}", tmp.display()))?;
     let mut buf = vec![0u8; CHUNK];
     loop {
         let read = reader.read(&mut buf).context("read response body")?;
@@ -154,7 +154,8 @@ fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
             bar.inc(read as u64);
         }
     }
-    file.flush().with_context(|| format!("flush {}", tmp.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", tmp.display()))?;
     drop(file);
     fs::rename(&tmp, dest)
         .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;

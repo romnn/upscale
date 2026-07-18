@@ -166,7 +166,9 @@ impl Dinov2 {
     fn interp_pos_embed(vb: &VarBuilder, device: &Device, dtype: DType) -> Result<Tensor> {
         let grid = INPUT / PATCH;
         let n_pre = PRETRAIN_GRID * PRETRAIN_GRID;
-        let full = vb.get((1, n_pre + 1, DIM), "pos_embed")?.to_dtype(DType::F32)?;
+        let full = vb
+            .get((1, n_pre + 1, DIM), "pos_embed")?
+            .to_dtype(DType::F32)?;
         let cls = full.i((.., 0..1))?;
         // [1, N, C] -> [C, grid, grid] for the separable bicubic pass.
         let patch = full
