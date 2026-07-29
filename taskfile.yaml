@@ -75,7 +75,7 @@ tasks:
     desc: "check for unused dependencies"
     aliases: [unused-dependencies]
     cmds:
-      - cargo +nightly udeps {{.CLI_ARGS}}
+      - cargo +nightly fc udeps --maximal-features --all-targets {{.CLI_ARGS}}
 
   outdated:
     desc: "check for outdated dependencies"

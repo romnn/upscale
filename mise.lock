@@ -61,23 +61,23 @@ url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/
 url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439294720"
 
 [[tools.ast-grep]]
-version = "0.44.1"
+version = "0.45.0"
 backend = "aqua:ast-grep/ast-grep"
 
 [tools.ast-grep."platforms.linux-x64"]
-checksum = "sha256:611f9e5e76f2611ecea1a35dd3468ceedf600641a11224b80341d79c6ee7b9dd"
-url = "https://github.com/ast-grep/ast-grep/releases/download/0.44.1/app-x86_64-unknown-linux-gnu.zip"
-url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/466366790"
+checksum = "sha256:78931ae35ebac33d9a72b3aecea3e3d62d6e5b0b718ac8bbedfbe69d68421e41"
+url = "https://github.com/ast-grep/ast-grep/releases/download/0.45.0/app-x86_64-unknown-linux-gnu.zip"
+url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/487374029"
 
 [tools.ast-grep."platforms.macos-arm64"]
-checksum = "sha256:0a2fef273b0ff1238b8307add911714f92021d25b919fa3ec9b6b2e046bb29cf"
-url = "https://github.com/ast-grep/ast-grep/releases/download/0.44.1/app-aarch64-apple-darwin.zip"
-url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/466368358"
+checksum = "sha256:ec2e3680f4f84c68b48420bcca01d21389787c7318b52083dde6f46ac12ad946"
+url = "https://github.com/ast-grep/ast-grep/releases/download/0.45.0/app-aarch64-apple-darwin.zip"
+url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/487376083"
 
 [tools.ast-grep."platforms.windows-x64"]
-checksum = "sha256:f122d5507e5206c3a9f030fc3a0d137070eb6c4f708e1b496df56795bc9858b9"
-url = "https://github.com/ast-grep/ast-grep/releases/download/0.44.1/app-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/466370609"
+checksum = "sha256:a1b5b7c06994992755d4cd0b9cf10c2f4a6e7b4a82d2810edee5985a59f67ac5"
+url = "https://github.com/ast-grep/ast-grep/releases/download/0.45.0/app-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/ast-grep/ast-grep/releases/assets/487376855"
 
 [[tools."github:est31/cargo-udeps"]]
 version = "0.1.61"
@@ -118,45 +118,45 @@ url = "https://github.com/kbknapp/cargo-outdated/releases/download/v0.19.0/cargo
 url_api = "https://api.github.com/repos/kbknapp/cargo-outdated/releases/assets/396434759"
 
 [[tools."github:romnn/cargo-feature-combinations"]]
-version = "0.3.0"
+version = "0.4.2"
 backend = "github:romnn/cargo-feature-combinations"
 
 [tools."github:romnn/cargo-feature-combinations".options]
 matching = "cargo-fc"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.linux-x64"]
-checksum = "sha256:bb639219bf36c2ebba4bec6b97023e8cde20545059bceadeb7556675a3bd83d5"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739164"
+checksum = "sha256:6171d8159bd67a3385847cf36a70663c20c27224fc63fffca5280c8b0446c7e3"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091514"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.macos-arm64"]
-checksum = "sha256:a34bfe2bc4f648bfb0c2b89b050f486b3795165ede388d8d3939286ae24eeaf5"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739148"
+checksum = "sha256:477daf33d5ce3eb256b8b1b433218c1c84064c2b31fd17ecd61e7ad9f06b80a4"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091522"
 
 [tools."github:romnn/cargo-feature-combinations"."platforms.windows-x64"]
-checksum = "sha256:59a4c8d3b95155f422aedbd429acae0ac27dbe4dde1d86f92c227b02e9526fd9"
-url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.3.0/cargo-fc_0.3.0_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/469739156"
+checksum = "sha256:34f62d3781305d5104f45ede34bd017e4fe7e267198564e82cbd46f72d063522"
+url = "https://github.com/romnn/cargo-feature-combinations/releases/download/v0.4.2/cargo-fc_0.4.2_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/cargo-feature-combinations/releases/assets/492091521"
 
 [[tools."github:romnn/micromux"]]
-version = "0.0.7"
+version = "0.1.1"
 backend = "github:romnn/micromux"
 
 [tools."github:romnn/micromux"."platforms.linux-x64"]
-checksum = "sha256:3def2a9251a53507f91b927ed700f202e5daf892d06f361fb46c28541e83c585"
-url = "https://github.com/romnn/micromux/releases/download/v0.0.7/micromux_0.0.7_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/392589889"
+checksum = "sha256:ec7f1b5d713638f3d8229b2cd424fc4a59a7f4669ffb8fb0f1d036765750ec47"
+url = "https://github.com/romnn/micromux/releases/download/v0.1.1/micromux_0.1.1_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/494073668"
 
 [tools."github:romnn/micromux"."platforms.macos-arm64"]
-checksum = "sha256:a2dd64ca954cdbba50d22e11967332ab135492251d942724dcff02c111bda09a"
-url = "https://github.com/romnn/micromux/releases/download/v0.0.7/micromux_0.0.7_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/392589888"
+checksum = "sha256:78b8bcdd137c74d980c3da7cf16dc7a0aa48cf8835599a5287d255090581dc55"
+url = "https://github.com/romnn/micromux/releases/download/v0.1.1/micromux_0.1.1_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/494073683"
 
 [tools."github:romnn/micromux"."platforms.windows-x64"]
-checksum = "sha256:51bf7ceafa60b92009afebe215887d0d3d918cd2ba5d6269ca8d523b0ed666ff"
-url = "https://github.com/romnn/micromux/releases/download/v0.0.7/micromux_0.0.7_windows_amd64.zip"
-url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/392589887"
+checksum = "sha256:45c4c4043024ce36548af30ca5f93b7eb525debb7b053f718ba7c465e36de4d9"
+url = "https://github.com/romnn/micromux/releases/download/v0.1.1/micromux_0.1.1_windows_amd64.zip"
+url_api = "https://api.github.com/repos/romnn/micromux/releases/assets/494073669"
 
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.23.0"
